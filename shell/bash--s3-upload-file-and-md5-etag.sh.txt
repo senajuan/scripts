@@ -1,0 +1,104 @@
+#!/bin/bash
+
+
+###############################################################################################
+## Purpose: to upload a local file to S3 with its MD5 hash as the AWS ETag
+###############################################################################################
+
+if (( $# == 2 )); then
+    s3_bucket=$1
+    file_to_upload=$2
+else
+    echo
+    echo "##############################################################################"
+    echo -e "Must provide exactly 2 arguments:"
+    echo -e "\t$0  <s3_bucket>  <local-file-to-upload>"
+    echo "##############################################################################"
+    echo
+    exit 1
+fi
+
+echo
+echo -n "Verifying if input file exists.................."
+if [[ ! -f $file_to_upload ]]; then
+    echo
+    echo "##############################################################################"
+    echo -e "Local input file not found ==> \"$file_to_upload\""
+    echo "##############################################################################"
+    echo
+    exit 1
+fi
+echo "ok"
+
+echo -n "Verifying destination S3 bucket exists.........."
+if ! aws s3 ls $s3_bucket >& /dev/null; then
+    echo
+    echo "#############################################################################"
+    echo -e "!!!  Unable to locate S3 bucket ==> \"$s3_bucket\""
+    echo -e "!!!  Exiting..."
+    echo "#############################################################################"
+    echo
+    exit 1
+fi
+echo "ok"
+
+echo -n "Checking if openssl is installed................"
+if ! which openssl >& /dev/null; then
+    echo "###############################################"
+    echo "\"openssl\" appears not installed."
+    echo "###############################################"
+    exit 1
+fi
+echo "ok"
+
+echo -n "Generating hash based on input file............."
+md5_sum_base64="$(openssl md5 -binary $file_to_upload | base64 )"
+echo "ok"
+
+echo -n "Uploading object to S3.........................."
+aws s3api put-object --bucket $s3_bucket --key $file_to_upload --body $file_to_upload --content-md5 "$md5_sum_base64"
+
+if [[ $? == 0 ]] ; then
+    echo -e "ok"
+    echo
+    echo "############################"
+    echo "### Operation Successful ###"
+    echo "############################"
+    echo
+fi
+
+######################################################
+######################################################
+### Then fetch in a separate python script, like so:
+######################################################
+######################################################
+
+#!/usr/bin/env python
+
+import boto3
+import botocore
+
+''' tf-serving/multicat.zip '''
+
+##bucket_name = 'update-ml-definitions-test'
+resource_name = 'spam_bfm_serving.zip'
+
+bucket_name = 'juan-testing-s3'
+##resource_name = 'spam_bfm_serving.zip'
+
+def s3_md5sum(bucket_name, resource_name):
+    try:
+        md5sum = boto3.client('s3').head_object(
+            Bucket=bucket_name,
+            Key=resource_name
+        )['ETag'][1:-1]
+    except botocore.exceptions.ClientError:
+        md5sum = None
+        pass
+    return md5sum
+
+print s3_md5sum(bucket_name, resource_name)
+
+##################
+## End of Code
+##################

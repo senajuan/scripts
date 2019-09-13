@@ -1,0 +1,532 @@
+#! /bin/ksh
+#####################################################################
+#####################################################################
+##                                                                 ##
+## Author: Juan Sena                                               ##
+##                                                                 ##
+## The purpose of this program is to continuously check the        ## 
+## java threads of the ftppush system. If it fails three(3)        ##
+## consecutive times to establish that the java threads are        ##
+## active, it will force a fail over by bringing down Samba.       ##
+##                                                                 ## 
+## This program is modular and should have the same affect         ## 
+## of a continuous while loops. A log is maintained in $LOG_FILE.  ## 
+##                                                                 ##
+#####################################################################
+#####################################################################
+
+#####################################
+## Source in .profile from ftppush 
+#####################################
+. /local/apps/ftppush/.profile
+
+
+##############################
+## Define Variables (general)
+##############################
+
+HOSTNAME=$(hostname)
+HOSTNAME_SUFFIX=$(echo $HOSTNAME|tr -d 'nys[tdp]fp') 
+BASE=/local/apps/ftppush/admin/serveradmin
+THREAD_STATUS_CMD=threadStatusTFp${HOSTNAME_SUFFIX}  ## TEST ##
+###THREAD_STATUS_CMD=threadStatusFp${HOSTNAME_SUFFIX}  ## PRODUCTION ##
+THREAD_STATUS_OUTPUT=/tmp/threadStatusFp${HOSTNAME_SUFFIX}.output
+THREAD_STATUS_OUTPUT_STDERR=/tmp/threadStatusFp${HOSTNAME_SUFFIX}_output.STDERR
+LOG_FILE=/var/tmp/ftppush_threads.log/`date "+%b%d.%T"`
+THREAD_STATUS_FAILURE_COUNT=/tmp/threadStatus${HOSTNAME_SUFFIX}_failure_count
+SHUTDOWN_SAMBA="/etc/init.d/samba.server stop"
+##SHUTDOWN_FTPPUSH_SERVICES="/etc/init.d/ftppush.services stop"
+
+SENDMAIL='/usr/lib/sendmail -t -oi'
+NOTIFICATION_LIST='juan_sena@standardandpoors.com'
+###MAIL_TO='nynetops@standardandpoors.com,risonlineoperations@standardandpoors.com'
+
+#################################
+## Now define "sleep" variables
+#################################
+
+### Number of seconds to wait for $THREAD_STATUS_CMD to run before aborting.
+	SLEEP_THREADS=30  
+## Under normal circumstances, the number of seconds to pause between thread checks.
+	SLEEP_NORMAL=60  
+### Number of seconds to sleep if Samba or Poller is down, before next threads check.
+	SLEEP_WHEN_SOMETHING_WRONG=300  
+
+
+
+###############################################
+## If script is killed (except with "kill -9"), 
+## then execute the statement below.
+###############################################
+trap '
+    clean_up
+    message="WARNING: Script was killed: $0" 
+    write_to_log "$message"
+    email_the_log "$message"
+    exit 2
+' 2 3 15
+    
+
+##############################
+## BEGIN FUNCTION "clean_up"
+##############################
+function clean_up
+{
+    ########################
+    ## Remove tmp files  ##
+    ########################
+    /bin/rm -rf $THREAD_STATUS_OUTPUT 2> /dev/null
+
+    test -s $THREAD_STATUS_OUTPUT_STDERR &&
+    message=$(< $THREAD_STATUS_OUTPUT_STDERR) &&
+    write_to_log "$message"
+    /bin/rm -rf $THREAD_STATUS_OUTPUT_STDERR 2> /dev/null
+
+    ##########################################################
+    ## Call function to kill any lingering threads (if any) ##
+    ##########################################################
+    kill_threadstatus_job
+}
+
+
+##########################################
+## BEGIN FUNCTION "kill_threadstatus_job"
+##########################################
+function kill_threadstatus_job
+{
+    if ps -ef|grep -i $THREAD_STATUS_CMD |/usr/xpg4/bin/grep -q -w $! ; then
+        kill -9 $!
+        sleep 2
+
+        if ps -ef|grep -i $THREAD_STATUS_CMD |/usr/xpg4/bin/grep -q -w $! ; then
+            message="WARNING: Unable to kill process $!"
+            write_to_log "$message"
+        fi
+    fi
+}
+
+##################################
+## BEGIN FUNCTION "write_to_log"
+##################################
+function write_to_log
+{
+    ## Below, "$1" is actually the contents of variable "$message", 
+    ## which is passed to this function.
+
+    print "$HOSTNAME | `date` | $1" >> $LOG_FILE
+}
+
+
+
+####################################
+## BEGIN FUNCTION "is_poller_up"  ##
+####################################
+function is_poller_up
+{
+    if ps -ef|grep -w -i poller|grep -v grep >/dev/null ; 
+    then 
+        is_samba_up "Poller is up"  ### Quoted argument is passed to the next function as "$1"
+    else 
+        is_samba_up "Poller is down" ### Quoted argument is passed to the next function as "$1"
+    fi
+}
+
+
+###########################################
+## BEGIN FUNCTION "is_samba_up"
+###########################################
+function is_samba_up
+{
+    ##################################
+    ## Check to see if Samba is up  ##
+    ##################################
+    SAMBA_PROCESSES=$(ps -ef|grep [sn]mbd|grep -v grep)
+    if [[ "$SAMBA_PROCESSES" == +(*nmbd*&*smbd*) ]] ; then
+
+        #################################
+        ### If Samba is UP, do this:  ###
+        #################################
+        case "$1" in
+            "Poller is up")
+                          run_check_threads
+                          verify_thread_results
+                          ;;
+
+            "Poller is down") 
+                          message='ALERT: The Poller process appears to be down!!!' 
+                          log_email_sleep_begin "$message"
+                          ;;
+
+             *)           message='Alert: Program logic error in 1st case statement of function named "is_samba_up" !' 
+                          log_email_sleep_begin "$message"
+                          ;;
+        esac
+
+    else
+
+        #######################################
+        ### If Samba is DOWN, then do this: ###
+        #######################################
+        case "$1" in
+            "Poller is up") 
+                          message='ALERT: Samba processes (smbd & nmbd) are NOT both up'
+                          log_email_sleep_begin "$message"
+                          ;; 
+
+            "Poller is down") 
+                          message='ALERT: Both Poller & Samba appear to be down!!!'
+                          log_email_sleep_begin "$message"
+                          ;;
+
+            *)            message='ALERT: Logic error in 2nd case statement of function named "is_samba_up"' 
+                          log_email_sleep_begin "$message"
+                          ;;
+        esac               
+    fi    
+    
+}        
+
+############################################
+### BEGIN FUNCTION "log_email_sleep_begin"
+############################################
+function log_email_sleep_begin
+{
+    write_to_log "$1"
+    email_the_log "$1" "$2"
+    #########################################
+    ### Take a knap and start again later ###
+    #########################################
+    sleep $SLEEP_WHEN_SOMETHING_WRONG
+    begin_program_logic
+}
+
+
+
+##########################################
+## BEGIN FUNCTION "start_failover_process"
+##########################################
+function start_failover_process
+{
+
+    ############################################################
+    ## Send all relevant output to $LOG_FILE before failover  ##
+    ############################################################
+
+    cat $THREAD_STATUS_FAILURE_COUNT >> $LOG_FILE &&
+    > $THREAD_STATUS_FAILURE_COUNT &&
+    print "*\n*\n*" >> $LOG_FILE
+
+    test -s $THREAD_STATUS_OUTPUT && 
+    cat $THREAD_STATUS_OUTPUT >> $LOG_FILE && 
+    print "*\n*\n*" >> $LOG_FILE 
+
+    test -s $THREAD_STATUS_OUTPUT_STDERR && 
+    cat $THREAD_STATUS_OUTPUT_STDERR >> $LOG_FILE &&
+    print "*\n*\n*" >> $LOG_FILE 
+    /bin/rm -rf $THREAD_STATUS_OUTPUT_STDERR 2> /dev/null
+
+
+    clean_up   ## Start clean up process ##
+
+
+    #######################
+    #######################
+    ### Shut down SAMBA ### 
+    #######################
+    #######################
+
+message2="
+############################################################
+############################################################
+###                                                      
+### DO NOT REBOOT $HOSTNAME UNLESS SPECIFICALLY REQUESTED
+###                                                     
+############################################################
+############################################################
+"
+
+    #########################################
+    ## Check for presence of Samba process ##
+    #########################################
+    if pgrep -x [sn]mbd > /dev/null ; 
+    then 
+
+        #######################################
+        ## Actual command to shut down Samba ##
+        #######################################
+        eval $SHUTDOWN_SAMBA  2>> $LOG_FILE ||   
+        pgrep -x [sn]mbd | /usr/bin/xargs -n10 -i{} kill -9 {} 2>> $LOG_FILE ## Graceful or by force ##
+
+        ###############################################
+        ## If Samba shutdown return code equals zero ##
+        ###############################################
+        if (( $? == 0 ))
+        then    
+            sleep 2
+
+            if pgrep [sn]mbd > /dev/null ;  ## Just making doubly sure Samba's down ##
+            then
+                message='ALERT: Attempting to failover, but unable to shut down Samba!!!'
+                log_email_sleep_begin "$message" "$message2"
+            else
+
+                #######################################
+                ### If Samba shutdown successfully  ###
+                #######################################
+                message='NOTICE: Failover in progress ; Samba successfully shut down!'
+                write_to_log "$message"
+                message="ALERT: A failover has occurred!"
+                log_email_sleep_begin "$message" "$message2"
+            fi
+
+        #################################################### 
+        # If Samba shutdown return code NOT equal to zero ##         
+        #################################################### 
+        else
+            message='ALERT: Attempting to failover, but unable to shut down Samba!!!'
+            log_email_sleep_begin "$message" "$message2"
+
+        fi
+
+    ######################################################
+    ## In the unlikely event that Samba is ALREADY down ##
+    ######################################################
+    else 
+        message='Preparing to failover, but Samba was somehow ALREADY down!'
+        log_email_sleep_begin "$message" "$message2"
+    fi
+
+}    #### End of function "start_failover_process ##
+
+
+
+#################################################
+## START FUNCTION "email_the_log" 
+#################################################
+function email_the_log
+{
+$SENDMAIL <<EOD
+To: $NOTIFICATION_LIST
+From: ftppush_$HOSTNAME
+Subject: "$1"
+ 
+"$2"
+
+############################################################
+Last 50 lines of the ThreadStatus message log
+(${HOSTNAME}:$LOG_FILE):
+############################################################
+
+`tail -50 $LOG_FILE`
+
+############################################################
+S A M B A    A N D    P O L L E R    P R O C E S S E S 
+############################################################
+
+`ps -ef|egrep '[sn]mbd'`
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+`ps -ef|egrep -i poller`
+
+
+############################################################
+  U S E R S   C U R R E N T L Y   L O G G E D   I N
+############################################################
+
+`/bin/w`
+
+
+############################################################
+PROCESSES   CURRENTLY   RUNNING  (first 20)
+############################################################
+
+`/usr/ucb/ps -auxw|head -20`
+
+
+############################################################
+#### END OF EMAIL
+############################################################
+
+Sincerely,
+Ftppush             
+
+EOD
+
+   #################################### 
+}  ## End of function "email_the_log" 
+   #################################### 
+
+
+
+##########################################
+### BEGIN FUNCTION "run_check_threads" ###
+##########################################
+function run_check_threads
+{
+
+    #####################################################
+    ## First of all, is "$THREAD_STATUS_CMD" executable? 
+    #####################################################
+
+    if [[ ! -x $BASE/$THREAD_STATUS_CMD ]] ;
+    then
+        message="ALERT: Not an executable command: $BASE/$THREAD_STATUS_CMD"
+        log_email_sleep_begin "$message"
+    else
+  
+    ###################################################################
+    ## If $THREAD_STATUS_CMD is executable, then empty out the file
+    ## created during every thread check execution (just in case)
+    ###################################################################
+    > $THREAD_STATUS_OUTPUT  
+
+    ########################################################
+    ## Now execute the actual $THREAD_STATUS_CMD command  ## 
+    ## and redirect output to $THREAD_STATUS_OUTPUT       ##
+    ########################################################
+    cd $BASE 
+    ./$THREAD_STATUS_CMD > $THREAD_STATUS_OUTPUT 2> $THREAD_STATUS_OUTPUT_STDERR & 
+                                              ## What should happen to ..STDERR file ?? ##
+
+    ########################################################
+    ## $SLEEP_THREAD is the number of seconds to wait for 
+    ## threadStatus job to complete before aborting it.
+    ########################################################
+    sleep $SLEEP_THREAD  ## How long we wait for the above command to complete ##
+
+    fi        
+  #######################################
+} ###  END FUNCTION "run_check_threads" 
+  #######################################
+
+
+#############################################
+### BEGIN FUNCTION "verify_thread_results" ##
+#############################################
+function verify_thread_results
+{
+    ###########################################################################
+    ## Criteria for determining the success of threadStatus check:
+    ##     1) it must generate an output file ($THREAD_STATUS_OUTPUT)
+    ##     2) the file must have 4 or more lines in it ($SIZE_OF_OUTPUT_FILE)
+    ##     3) the file must contain the words "Opened socket"
+    ## Otherwise, assume failure.
+    ###########################################################################
+
+
+    ######################################
+    ## Preparating to verify results    ##
+    ######################################
+    kill_threadstatus_job   ## In case it has chosen to hang.   
+    SIZE_OF_OUTPUT_FILE=$(wc -l $THREAD_STATUS_OUTPUT|awk '{print $1}')
+    THREAD_STATUS_OUTPUT_VAR=$(< $THREAD_STATUS_OUTPUT) # Read entire file into variable
+
+
+    #######################################
+    #######################################
+    ### S U C C E S S   C R I T E R I A ###
+    #######################################
+    #######################################
+    if  { [[ -s "$THREAD_STATUS_OUTPUT" ]] &&
+          (( "$SIZE_OF_OUTPUT_FILE" >= 4 )) &&
+          [[ "$THREAD_STATUS_OUTPUT_VAR" == +(*Opened socket*) ]] 
+        }
+    then
+
+        ###############################
+        ###############################
+        ## If thread status SUCCEEDS ##
+        ###############################
+        ###############################
+
+        message="NOTICE: Threads OK"    
+        write_to_log "$message"        
+
+        #################################################################
+        ## In case any previous thread checks failed. Clean the slate. ##
+        #################################################################
+        > $THREAD_STATUS_FAILURE_COUNT 
+        clean_up  ## Clean up any lingering stuff ##
+
+        ###########################################################################################
+        ## $SLEEP_NORMAL is the number of seconds to pause before re-checking thread status again.
+        ###########################################################################################
+        sleep $SLEEP_NORMAL 
+        begin_program_logic
+
+    else
+        ############################
+        ############################
+        ## If thread status FAILS ##
+        ############################
+        ############################
+        message="WARNING: Unable to verify thread status"
+        write_to_log "$message"
+        print "$HOSTNAME | `date` | $message" >> $THREAD_STATUS_FAILURE_COUNT
+
+        ###########################################
+        ## How many consecutive times did it fail?
+        ###########################################
+        CONSECUTIVE_FAILURES=$(wc -l $THREAD_STATUS_FAILURE_COUNT |awk '{print $1}')
+        if (( $CONSECUTIVE_FAILURES >= 3 ))
+        then
+            ##########################3#############################
+            ## If consecutive failures is 3 or more, then failover
+            ########################################################
+            print "*\n*\n*" >> $LOG_FILE
+            message="ALERT: Failure to verify threads after three (3) consecutive attempts!"
+            write_to_log "$message"
+
+            start_failover_process  
+    
+            #######################################################
+            ## Otherwise, if consecutive failures is less than 3 ##
+            #######################################################
+        else
+            clean_up  ## Clean up any lingering mess ##
+            sleep $SLEEP_NORMAL ## Number of seconds to pause before re-checking thread status again.
+            begin_program_logic
+        fi
+
+    fi
+
+   ############################################
+}  ### END FUNCTION "verify_thread_results" ###
+   ############################################
+
+          ########################################################
+          ########################################################
+          ########################################################
+          ####                                                ####
+          ####   B E G I N     P R O G R A M    L O G I C     ####
+          ####                                                ####
+          ########################################################
+          ########################################################
+          ########################################################
+
+
+#######################################
+### When the script first starts up ###
+#######################################
+clean_up
+begin_program_logic
+
+
+#####################################################
+### Checking POLLER starts off the entire process ###
+#####################################################
+
+
+###########################################
+###########################################
+###########################################
+### START FUNCTION "being_program_logic ###
+###########################################
+###########################################
+###########################################
+function begin_program_logic
+{
+    is_poller_up
+}
+#########################################
+### END FUNCTION "begin_program_logic ###
+#########################################

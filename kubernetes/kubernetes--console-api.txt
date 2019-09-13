@@ -1,0 +1,392 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: console-api
+  namespace: prod
+  labels:
+    app: console-api
+spec:
+  selector:
+    app: console-api
+  ports:
+  - port: 80
+    protocol: TCP
+    # Set this to the containerPort
+    targetPort: 80
+    name: external
+  type: ClusterIP
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: console-api
+  namespace: prod
+  labels:
+    app: console-api
+spec:
+  # The number of redundant containers started
+  replicas: 1
+  selector:
+    matchLabels:
+      app: console-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: console-api
+    spec:
+      containers:
+      - name: console-api
+        image: triplelift/console-api:prod-latest
+        # Setting this to Always will cause the container image to be pulled each time even if the tag is the same
+        imagePullPolicy: Always
+        # Specify the ports the application is listening on
+        ports:
+        - containerPort: 80
+          name: external
+        # Environment variables
+        env:
+        - name: APPNEXUS_AD_PROFILE_ID
+          value: '86905'
+        - name: APPNEXUS_API_URL
+          value: 'api.appnexus.com'
+        - name: APPNEXUS_BIDDER_MEMBER_ID
+          value: '1556'
+        - name: APPNEXUS_BIDDER_URL
+          value: 'api.adnxs.com'
+        - name: APPNEXUS_DSP_MEMBER_ID
+          value: '3335'
+        - name: AWS_ASSET_BUCKET
+          value: 'assets.triplelift.com'
+        - name: AWS_CF
+          value: 'static.adpinr.com'
+        - name: AWS_DYNAMIC_3LIFT_BUCKET
+          value: 'dynamic.3lift.com'
+        - name: AWS_IMAGE_BUCKET
+          value: 'images.adpinr.com'
+        - name: AWS_IMAGE_DOMAIN
+          value: 'images.3lift.com'
+        - name: AWS_SCREENSHOT_3LIFT_BUCKET
+          value: 'screenshot.3lift.com'
+        - name: BLUEKAI_DEFAULT_AUDIENCE
+          value: '328387,353038'
+        - name: BLUEKAI_DEFAULT_CAMPAIGN
+          value: '79286'
+        - name: BLUEKAI_HOST
+          value: 'http://services.bluekai.com/'
+        - name: CREATIVE_SUBMISSION_API_URL
+          value: 'http://creative-submission.prod.triplelift.net'
+        - name: DRUID_HOST
+          value: 'broker1.druid.prod.triplelift.net'
+        - name: DRUID_PORT
+          value: '8080'
+        - name: IMAGE_LIB
+          value: 'GD2'
+        - name: IMAGE_LIB_PATH
+          value: ''
+        - name: LDAP_DOMAIN
+          value: ''
+        - name: LDAP_URL
+          value: ''
+        - name: LOCALSTACK_ENABLE
+          value: ''
+        - name: LOCALSTACK_S3_URL
+          value: ''
+        - name: MESSAGING_CONF_API_PORT
+          value: '15672'
+        - name: MESSAGING_CONF_HOST
+          value: 'rabbit.prod.triplelift.net'
+        - name: MESSAGING_CONF_PORT
+          value: '5672'
+        - name: MESSAGING_CONF_VIRTUAL_HOST
+          value: '/'
+        - name: MESSAGING_EXCHANGE_EXCHANGE_NAME
+          value: 'exchange.task.v002'
+        - name: MESSAGING_IMAGE_CACHE_EXCHANGE_NAME
+          value: 'image_cache.task.v001'
+        - name: MESSAGING_REPORTING_EXCHANGE_NAME
+          value: 'reporting.task.v002'
+        - name: MESSAGING_TASK_SERVICE_EXCHANGE_NAME
+          value: 'etl.task.v002'
+        - name: MYSQL_RW_DB
+          value: 'triplelift'
+        - name: REDSHIFT_RW_DB
+          value: 'prod'
+        - name: REDSHIFT_RW_PORT
+          value: '5439'
+        - name: REPORTING_BUFFER_SIZE_BYTES
+          value: '5000000'
+        - name: REPORTING_S3_DOWNLOAD_BUCKET
+          value: 'reports.triplelift.com'
+        - name: REPORTING_SERVICE_URL
+          value: 'https://reporting-service.prod.triplelift.net'
+        - name: SALESFORCE_AUTH_URL
+          value: 'https://login.salesforce.com/services/oauth2/token'
+        - name: SALESFORCE_BASE_HOST
+          value: 'https://na14.salesforce.com'
+        - name: SALESFORCE_DATA_HOST
+          value: 'https://na14.salesforce.com/services/data/v20.0/'
+        - name: SALESFORCE_GRANT_TYPE
+          value: 'password'
+        - name: SENTRY_DSN_CONSOLE_API
+          value: 'https://d8a48a332df54660a5e39ed220acebaa:1b6c72e7830c499da7e54fa511308223@sentry.triplelift.net/8'
+        - name: STATSD_PREFIX_API
+          value: 'api.prod.'
+        - name: TL_AN_LIFETIME_PACING_SPAN
+          value: '3'
+        - name: TL_API_URL
+          value: 'api.triplelift.com'
+        - name: TL_DEFAULT_AN_IMPRESSION_DISCREPANCY
+          value: '.1'
+        - name: TL_DEFAULT_DEMAND_ADVERTISER_ID
+          value: '406'
+        - name: TL_DEFAULT_LI_CPC_MARGIN
+          value: '.35'
+        - name: TL_DEFAULT_LI_CPM_MARGIN
+          value: '.65'
+        - name: TL_EMAIL_ALERTS
+          value: 'alerts@triplelift.com'
+        - name: TL_EMAIL_AN_SERVICES
+          value: 'appnexus-app-services@triplelift.com'
+        - name: TL_EMAIL_EXTERNAL_AUDIT
+          value: 'msn@triplelift.com'
+        - name: TL_EMAIL_PUBPAYMENTS
+          value: 'pubpayments@triplelift.com'
+        - name: TL_EMAIL_SENDER
+          value: 'no-reply@triplelift.com'
+        - name: TL_EMAIL_SERVICES
+          value: 'services-alerts@triplelift.com'
+        - name: TL_EMAIL_SUPPORT
+          value: 'support@triplelift.com'
+        - name: TL_IMG_URL
+          value: 'img.3lift.com'
+        - name: BRAND_SERVICE_HOST
+          value: 'https://brand-service.prod.triplelift.net'
+        - name: TL_CONSOLE_UI
+          value: 'https://console.triplelift.com'
+        - name: TL_REDIRECT_CONSOLE2_URL
+          value: 'https://adserver.triplelift.com/'
+        - name: TL_REDIRECT_CONSOLE2_COOKIE_NAME
+          value: 'auth_token'
+        - name: ENVIRONMENT
+          value: 'production'
+        - name: SUB_ENVIRONMENT
+          value: 'staging'
+        - name: ENABLE_PROFILER
+          value: 'false'
+        - name: ENABLE_DB_PROFILER
+          value: 'false'
+#    ------------- APP CONFIG -------------
+
+
+#    ------ GLOBAL DATABASE CONFIG -------
+        - name: MYSQL_RW_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: databases
+              key: MYSQL_RW_HOST
+        - name: REDSHIFT_RW_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: databases
+              key: REDSHIFT_BIDDER_PORT
+
+        - name: REDSHIFT_RW_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: databases
+              key: REDSHIFT_BIDDER_HOST
+
+        - name: MYSQL_RW_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: databases
+              key: MYSQL_RW_PORT
+
+#    ----------- SECRETS -----------------
+        - name: APPNEXUS_API_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: APPNEXUS_API_USER
+
+        - name: MONGO_RW_URI
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MONGO_RW_URI
+        - name: APPNEXUS_API_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: APPNEXUS_API_PASSWORD
+        - name: APPNEXUS_BIDDER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: APPNEXUS_BIDDER_PASSWORD
+        - name: APPNEXUS_BIDDER_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: APPNEXUS_BIDDER_USER
+        - name: AWS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: AWS_API_KEY
+        - name: AWS_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: AWS_API_SECRET
+        - name: BLUEKAI_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: BLUEKAI_PRIVATE_KEY
+        - name: BLUEKAI_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: BLUEKAI_USER
+        - name: GOOGLE_SIMPLE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: GOOGLE_SIMPLE_API_KEY
+        - name: MESSAGING_CONF_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MESSAGING_CONF_USERNAME
+        - name: MESSAGING_CONF_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MESSAGING_CONF_PASSWORD
+        - name: MYSQL_RW_API_PASS
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MYSQL_RW_API_PASS
+        - name: MYSQL_RW_API_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MYSQL_RW_API_USER
+        - name: MYSQL_RW_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MYSQL_RW_PASSWORD
+        - name: MYSQL_RW_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: MYSQL_RW_USER
+        - name: REDSHIFT_RW_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: REDSHIFT_RW_PASSWORD
+        - name: REDSHIFT_RW_USER
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: REDSHIFT_RW_USER
+        - name: SALESFORCE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_CLIENT_ID
+        - name: SALESFORCE_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_CLIENT_SECRET
+        - name: SALESFORCE_MEM_RECORD_ID
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_MEM_RECORD_ID
+        - name: SALESFORCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_PASSWORD
+        - name: SALESFORCE_RECORD_ID
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_RECORD_ID
+        - name: SALESFORCE_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: SALESFORCE_USERNAME
+        - name: TL_API_TOKEN_ADMIN
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: TL_API_TOKEN_ADMIN
+        - name: TL_CRYPT_SALT
+          valueFrom:
+            secretKeyRef:
+              name: console-api
+              key: TL_CRYPT_SALT
+
+        - name: LOG_LEVEL
+          value: WARN
+      # Specify the secret to use when pulling images from the container registry
+      imagePullSecrets:
+      - name: docker-hub
+---
+
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: console-api
+  namespace: prod
+  labels:
+    app: console-api
+  annotations:
+    ingress.kubernetes.io/enable-cors: 'true'
+    zalando.org/skipper-ingress-redirect: 'false'
+spec:
+  rules:
+  # The public host to create on the DNS server
+  - host: console-api1.prod.triplelift.net
+    http:
+      paths:
+      # The name of the service and the port from the service
+      - backend:
+          serviceName: console-api
+          servicePort: 80
+  - host: console-api2.prod.triplelift.net
+    http:
+      paths:
+      # The name of the service and the port from the service
+      - backend:
+          serviceName: console-api
+          servicePort: 80
+  - host: console-api3.prod.triplelift.net
+    http:
+      paths:
+      # The name of the service and the port from the service
+      - backend:
+          serviceName: console-api
+          servicePort: 80
+  - host: api.triplelift.com
+    http:
+      paths:
+      # The name of the service and the port from the service
+      - backend:
+          serviceName: console-api
+          servicePort: 80

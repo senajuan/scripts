@@ -1,0 +1,614 @@
+--- ### Configure Airflow
+
+
+- name: Start mysqld service
+  systemd:
+    name: mysqld
+    daemon_reload: yes
+    state: started
+    enabled: yes
+  become: yes
+
+- name: Create MySQL database
+  mysql_db:
+    collation: utf8_unicode_ci
+    encoding: utf8
+    login_host: localhost
+    login_port: 3306
+    login_user: root
+    name: airflow
+    state: present
+  become: yes
+
+- name: Grant MySQL privileges to airflow user
+  mysql_user:
+    name: airflow
+    password: airflow
+    priv: '*.*:ALL'
+    state: present
+  become: yes
+
+
+- name: Initialize Airflow database
+  shell: airflow initdb
+
+
+- name: Clear DAGs directory
+  file: path="{{ airflow.homedir }}/dags" state=absent
+
+
+- name: Create directory for airflow and DAGs
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ common.box_user }}"
+    mode: "{{ item.mode | default(0755) }}"
+  with_items:
+    - path: "{{ airflow.homedir }}/dags"
+    ##- path: "{{ airflow.homedir }}/testing"  #### For riskrating testing TEMPORARY
+    - path: "{{ common.shared_storage_path }}"
+    - path: "{{ common.shared_storage_path }}/cassandra_airflow.dir"
+    - path: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir"
+    - path: "{{ airflow.dag_block_feed.block_feed_path }}"
+    - path: "{{ common.shared_storage_path }}/spark_inflight"
+  ignore_errors: true
+  become: true
+  tags: [ 'create_dirs' ]
+
+
+- name: Create directory for airflow and DAGs
+  file:
+    path: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/state.dir"
+    state: directory
+    owner: "{{ common.box_user }}"
+    group: "{{ common.box_user }}"
+    mode: 0777
+    recurse: yes
+  tags: [ 'create_state_dir' ]
+
+
+####################################################################
+###  Related to Cassandra Repair DAG
+####################################################################
+- name: Ensure following files exist
+  template: src={{ item.src }} dest={{ item.dest }} mode=0666 force=yes group={{ common.box_user }} owner={{ common.box_user }}
+  with_items:
+    - { src: "cassandra-repair-format-info.txt.j2",   dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/repair-template.txt" }
+    - { src: "cassandra-repair-nodes.txt.j2",         dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/datacenters-and-nodes.txt" }
+    - { src: "{{ playbook_dir}}/../DSECassandra-ansible/roles/Monitoring-scripts/file/schema_list.txt",
+                                                      dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/keyspaces-and-tables.txt" }
+    ##- { src: "cassandra-repair-format-info.txt.j2", dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/datacenters-and-nodes.txt" }
+    ##- { src: "keyspaces-and-tables.txt.j2",         dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/keyspaces-and-tables.txt" }
+  ignore_errors: true
+  tags: ['template_files']
+
+
+- name: Check if {{ common.shared_storage_path }} is a mountpoint
+  shell: mountpoint -q {{ common.shared_storage_path }}
+  register: mountpoint
+  failed_when: False
+  changed_when: False
+  tags: ['fcontext']
+
+- name: Allow httpd to read nfs if {{ common.shared_storage_path }} is a  mountpoint
+  shell: setsebool -P httpd_use_nfs=1
+  ##when: mountpoint
+  when: mountpoint.rc == 0
+  become: true
+  tags: ['fcontext']
+
+- name: Change SELinux fcontext of files if {{ common.shared_storage_path }} is not mountpoint
+  shell: chcon -R -t httpd_sys_script_rw_t {{ item }}
+  with_items:
+    - "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/keyspaces-and-tables.txt"
+    - "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/datacenters-and-nodes.txt"
+    - "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/repair-template.txt"
+    - "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/state.dir"
+  become: true
+  when: mountpoint.rc != 0
+  ##when: not mountpoint
+  tags: ['fcontext']
+####################################################################
+####################################################################
+
+- name: Create directory for ftp_target_dir
+  file:
+    path: "{{ airflow.dag_block_feed.ftp_target_dir }}"
+    state: directory
+  delegate_to: "{{ groups['blockfeed_ftp'][0] }}"
+  when: groups['blockfeed_ftp'][0] is defined
+  tags: ['ftp_target_dir']
+
+
+- name: Get public ip address
+  shell: dig +short myip.opendns.com @resolver1.opendns.com
+  register: airflow_public_ip
+  when: airflow.public_or_private_ip == "public"
+  tags: ['airflow_ui']
+
+- set_fact:
+    airflow_ip: "{{ airflow_public_ip.stdout }}"
+  when: airflow.public_or_private_ip == "public"
+  tags: ['airflow_ui']
+
+- set_fact:
+    airflow_ip: "{{ ansible_default_ipv4.address }}"
+  when: (airflow.public_or_private_ip == "private") or
+        (airflow.public_or_private_ip != "public" and airflow.public_or_private_ip != "private")
+  tags: ['airflow_ui']
+
+
+- name: Copy dags and scripts... etc
+  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }}
+  with_items:
+   - { src: "airflow.cfg.j2", dest: "{{ airflow.homedir }}/airflow.cfg", mode: 644 }
+   - { src: "start-stop-airflow.sh.j2", dest: "{{ airflow.homedir }}/start-stop-airflow.sh" }
+   - { src: "create-airflow-user.py.j2", dest: "{{ airflow.homedir }}/create-airflow-user.py" }
+   - { src: "blockfeed-filecopy-scp.sh.j2", dest: "{{ airflow.homedir }}/blockfeed-filecopy-scp.sh" }
+   - { src: "clustering.properties.j2", dest: "{{ common.shared_storage_path }}/spark_clustering/clustering.properties",mode: 644 }
+   - { src: "rna-clustering.py.j2", dest: "{{ airflow.homedir }}/dags/rna-clustering.py" }
+   - { src: "rna-analytics.py.j2", dest: "{{ airflow.homedir }}/dags/rna-analytics.py" }
+   - { src: "rna-riskrating-blockfeed.py.j2", dest: "{{ airflow.homedir }}/dags/rna-riskrating-blockfeed.py" }
+   - { src: "cassandra-repair-pickle.py", dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/cassandra-repair-pickle.py" }
+   - { src: "rna-cassandra-bkup-incr.py.j2", dest: "{{ airflow.homedir }}/dags/rna-cassandra-bkup-incr.py" }
+   - { src: "rna-cassandra-bkup-full.py.j2", dest: "{{ airflow.homedir }}/dags/rna-cassandra-bkup-full.py" }
+   - { src: "rna-cassandra-del-old-bkups.py.j2", dest: "{{ airflow.homedir }}/dags/rna-cassandra-del-old-bkups.py" }
+   - { src: "{{ playbook_dir }}/../DSECassandra-ansible/roles/Monitoring-scripts/file/backup.sh", dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/backup.sh" }
+   - { src: "{{ playbook_dir }}/../DSECassandra-ansible/roles/Monitoring-scripts/file/repair.sh", dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/repair.sh" }
+   - { src: "rna-update-ml-definition.py.j2", dest: "{{ airflow.homedir }}/dags/rna-update-ml-definition.py" }
+   - { src: "rna-postMLclust-ham-spam-a2p.py.j2", dest: "{{ airflow.homedir }}/dags/rna-postMLclust-ham-spam-a2p.py" }
+   - { src: "postml-clustering.properties.j2", dest: "{{ common.shared_storage_path }}/spark_clustering/postml-clustering.properties",mode: 644 }
+   - { src: "rna-update-ml-inflight.py.j2", dest: "{{ airflow.homedir }}/dags/rna-update-ml-inflight.py" }
+   - { src: "rna-cassandra-repair.py.j2", dest: "{{ airflow.homedir }}/dags/rna-cassandra-repair.py" }
+   - { src: "create-template.sh.j2", dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/create-template.sh" }
+   - { src: "zzz-reset-offset-riskrating.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-riskrating.py" }
+   - { src: "zzz-reset-offset-clustering.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-clustering.py" }
+   - { src: "zzz-reset-offset-analytics.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-analytics.py" }
+   - { src: "zzz-reset-offset-ml.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-ml.py" }
+   - { src: "zzz-reset-offset-keyword.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-keyword.py" }
+   - { src: "zzz-reset-offset-urlviolations.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-urlviolations.py" }
+   - { src: "restart-airflow-scheduler.sh", dest: "{{ airflow.homedir }}/restart-airflow-scheduler.sh" }
+   - { src: "zzz-reset-offset-analytics-zookeeper.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-analytics-zookeeper.py" }
+   - { src: "zzz-reset-offset-clustering-postML-zookeeper.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-clustering-postML-zookeeper.py" }
+   - { src: "zzz-reset-offset-clustering-zookeeper.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-clustering-zookeeper.py" }
+   - { src: "zzz-reset-offset-riskrating-zookeeper.py.j2", dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-riskrating-zookeeper.py" }
+   - { src: "rna.change-offset.sh.j2", dest: "{{ airflow.homedir }}/rna.change-offset.sh" }
+   - { src: "rna.change-offset-zookeeper.sh.j2", dest: "{{ airflow.homedir }}/rna.change-offset-zookeeper.sh" }
+   - { src: "rna-mdn-ml-whitelist.py.j2", dest: "{{ airflow.homedir }}/dags/rna-mdn-ml-whitelist.py" }
+  ignore_errors: yes
+  tags: [ 'copy_dags' ]
+
+
+- name: Copy DAGs when "deploy" equals "aws_syniverse"
+  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }}
+  with_items:
+   - { src: "rna-mdn-relationship.py.j2", dest: "{{ airflow.homedir }}/dags/rna-mdn-relationship.py" }
+   - { src: "mdn-relationship.properties.j2", dest: "{{ common.shared_storage_path }}/spark_mdn_relationship/application.properties" }
+  ##when: deploy|default('nodeploy') == 'all'
+  when: deploy|default('all') == 'aws_syniverse'
+  ##tags: [ 'aws_syniverse' ]
+  tags: [ 'deploy_all' ]
+
+
+- name: Copy Kafka offset scripts also to first Kafka server in kafka_group
+  delegate_to: "{{ groups['kafka_group'][0] }}"
+  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }}
+  with_items:
+    #### {{ common.install_base_path }} or {{ common.soft_link_base_path }}
+    - { src: rna.change-offset.sh.j2,           dest: "{{ common.install_base_path }}/kafka/bin/rna.change-offset.sh" }
+    - { src: rna.change-offset-zookeeper.sh.j2, dest: "{{ common.install_base_path }}/zookeeper/bin/rna.change-offset-zookeeper.sh" }
+  tags: ['offset_scripts']
+
+
+##############################################
+############### FOR TESTING ##################
+##############################################
+## testing-riskrating-backup.sh
+## testing-riskrating-cassandra-bkup-full-s3.py
+## testing-riskrating-cql-commands-to-run
+## testing-riskrating-cql-commands-to-run2
+## testing-riskrating-cycle.py.j2
+## testing-riskrating-dag.py.j2
+## testing-riskrating-params.txt
+## testing-riskrating-reset_tables.j2
+## testing-riskrating-update_config-script.sh
+
+##- name: Copy testing DAG only
+##  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }}
+##  with_items:
+##   ## - { src: "rna-cassandra-repair.py.j2",dest: "{{ airflow.homedir }}/dags/rna-cassandra-repair.py" }
+##   ##- { src: "create-template.sh.j2",               dest: "{{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir/create-template.sh" }
+##   - { src: "testing-riskrating-backup.sh", dest: "{{ airflow.homedir }}/testing/testing-riskrating-backup.sh" }
+##   - { src: "testing-riskrating-cassandra-bkup-full-s3.py", dest: "{{ airflow.homedir }}/dags/testing-riskrating-cassandra-bkup-full-s3.py" }
+##   - { src: "testing-riskrating-cql-commands-to-run", dest: "{{ airflow.homedir }}/testing/testing-riskrating-cql-commands-to-run" }
+##   - { src: "testing-riskrating-cycle.py.j2", dest: "{{ airflow.homedir }}/dags/testing-riskrating-cycle.py" }
+##   - { src: "testing-riskrating-dag.py.j2", dest: "{{ airflow.homedir }}/dags/testing-riskrating-dag.py" }
+##   - { src: "testing-riskrating-params.txt", dest: "{{ airflow.homedir }}/testing/testing-riskrating-params.txt" }
+##   - { src: "testing-riskrating-reset_tables.j2", dest: "{{ airflow.homedir }}/testing/testing-riskrating-reset_tables" }
+##   - { src: "testing-riskrating-update_config-script.sh", dest: "{{ airflow.homedir }}/testing/testing-riskrating-update_config-script.sh" }
+##   - { src: "testing-riskrating-start-from-line-number", dest: "{{ airflow.homedir }}/testing/testing-riskrating-start-from-line-number" }
+##  tags: [ 'riskrating_testing' ]
+
+
+- name: Copy 1 DAG only
+  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }}
+  with_items:
+   ##- { src: "testing-riskrating-cycle.py.j2", dest: "{{ airflow.homedir }}/dags/testing-riskrating-cycle.py" }
+   ##- { src: "xxxxx", dest: "{{ airflow.homedir }}/dags/xxxxx.py" }
+   - { src: "zzz-reset-offset-analytics.py.j2",      dest: "{{ airflow.homedir }}/dags/zzz-reset-offset-analytics.py" }
+  tags: [ 'copy_1' ]
+##############################################
+##############################################
+##############################################
+
+
+########################################################################################
+########################################################################################
+###                    Also for Cassandra Repair
+########################################################################################
+########################################################################################
+- name: Install Apache (required for Cassandra Repair workflow)
+  yum: name=httpd state=present
+  become: true
+
+- name: Copy cgi scripts to dest
+  template:
+    src: "{{ item.src }}"
+    dest: "/var/www/cgi-bin/{{ item.dest }}"
+    mode: "{{ item.mode | default (755) }}"
+    owner: "{{ common.box_user }}"
+  with_items:
+   - { src: "cassandra-change-state.sh.j2",               dest: "cassandra-change-state.sh" }
+   - { src: "cassandra-create-state-file-template.sh.j2", dest: "cassandra-create-state-file-template.sh" }
+   - { src: "cassandra-example-of-file-formats.sh.j2",    dest: "cassandra-example-of-file-formats.sh" }
+   - { src: "cassandra-list-keyspaces-and-tables.sh.j2",  dest: "cassandra-list-keyspaces-and-tables.sh" }
+   - { src: "cassandra-list-of-nodes.sh.j2",              dest: "cassandra-list-of-nodes.sh" }
+   - { src: "cassandra-readme.sh.j2",                     dest: "cassandra-readme.sh" }
+   - { src: "cassandra-repair-status.sh.j2",              dest: "cassandra-repair-status.sh" }
+   - { src: "cassandra-script-to-create-template.sh.j2",  dest: "cassandra-script-to-create-template.sh" }
+  become: true
+  tags: ['copy_cgi_scripts']
+
+- name: Copy Airflow config and Apache config files
+  template: src={{ item.src }} dest={{ item.dest }} mode={{ item.mode | default (755) }} owner={{ common.box_user }}
+  with_items:
+   - { src: "httpd.conf.j2",         dest: "/etc/httpd/conf/httpd.conf" }
+   - { src: "airflow-www_app.py.j2", dest: "/usr/lib/python2.7/site-packages/airflow/www/app.py" }
+  become: true
+  tags: ['airflow_ui']
+
+- name: Allow permission for cgi scripts
+  shell: semanage boolean -m --on httpd_enable_cgi
+  become: true
+
+- name: Allow scripts permission to execute
+  shell: semanage fcontext -a -t httpd_sys_script_exec_t /var/www/cgi-bin/{{ item }} ; restorecon /var/www/cgi-bin/{{ item }}
+  with_items:
+    - cassandra-change-state.sh
+    - cassandra-create-state-file-template.sh
+    - cassandra-example-of-file-formats.sh
+    - cassandra-list-keyspaces-and-tables.sh
+    - cassandra-list-of-nodes.sh
+    - cassandra-readme.sh
+    - cassandra-repair-status.sh
+    - cassandra-script-to-create-template.sh
+  become: true
+
+- name: Make sure httpd service is running
+  systemd:
+    name: httpd
+    ##state: started
+    enabled: yes
+    state: reloaded
+    masked: no
+  become: true
+
+
+###########################################
+- name: Reset Airflow database
+  shell: timeout 2m airflow resetdb -y
+  register: output_of_resetdb
+  no_log: true
+  ignore_errors: true
+###########################################
+
+
+###############################
+### Create Airflow variables
+###############################
+
+- name: Generate Airflow variables --- reset-offset-kafka-node
+  shell: 'airflow variables -s "zzz-reset-offset-kafka-node" "{{ groups["kafka_group"][0] }}"'
+  tags: ['reset-offset-kafka-node']
+
+- name: Generate Airflow variables --- reset-offset-zookeeper-node
+  shell: 'airflow variables -s "zzz-reset-offset-zk-node" "{{ groups["zookeeper_group"][0] }}"'
+  tags: ['reset-offset-zk-node']
+
+- name: Generate Airflow variables --- Clustering
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: clustering
+  with_items:
+    - { key: "{{job}}_spark_cores_max",       value: "{{ airflow.dag_clustering.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",  value: "{{ airflow.dag_clustering.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory", value: "{{ airflow.dag_clustering.spark_executor_memory }}" }
+    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_clustering.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_clustering.sla }}" }
+  tags: ['test1']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Risk Rating
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: riskrating
+  with_items:
+    - { key: "{{job}}_spark_cores_max",       value: "{{ airflow.dag_risk_rating.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",  value: "{{ airflow.dag_risk_rating.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory", value: "{{ airflow.dag_risk_rating.spark_executor_memory }}" }
+    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_risk_rating.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_risk_rating.sla }}" }
+  tags: ['test2']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Block Feed
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: blockfeed
+  with_items:
+    ##- { key: "{{job}}_spark_cores_max",       value: "{{ airflow.dag_block_feed.spark_cores_max }}" }
+    ##- { key: "{{job}}_spark_executor_cores",  value: "{{ airflow.dag_block_feed.spark_executor_cores }}" }
+    ##- { key: "{{job}}_spark_executor_memory", value: "{{ airflow.dag_block_feed.spark_executor_memory }}" }
+    ##- { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_block_feed.schedule_interval }}" }
+    ##- { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_block_feed.sla }}" }
+    - { key: "{{job}}_ftp_on_or_off",           value: "{{ airflow.dag_block_feed.ftp_on_or_off }}" }
+    - { key: "{{job}}_ftp_scp_script",          value: "{{ airflow.dag_block_feed.ftp_scp_script }}" }
+    - { key: "{{job}}_ftp_source_dir",          value: "{{ airflow.dag_block_feed.ftp_source_dir }}" }
+    - { key: "{{job}}_ftp_username",            value: "{{ airflow.dag_block_feed.ftp_username }}" }
+    - { key: "{{job}}_ftp_target_host",         value: "{{ airflow.dag_block_feed.ftp_target_host }}" }
+    - { key: "{{job}}_ftp_target_dir",          value: "{{ airflow.dag_block_feed.ftp_target_dir }}" }
+  tags: ['test3']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Spark Analytics
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: analytics
+  with_items:
+    - { key: "{{job}}_spark_cores_max",        value: "{{ airflow.dag_spark_analytics.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",   value: "{{ airflow.dag_spark_analytics.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory",  value: "{{ airflow.dag_spark_analytics.spark_executor_memory }}" }
+    - { key: "{{job}}_schedule_interval",      value: "{{ airflow.dag_spark_analytics.schedule_interval }}" }
+    - { key: "{{job}}_refresh_cache_duration", value: "{{ airflow.dag_spark_analytics.refresh_cache_duration }}" }
+    - { key: "{{job}}_sla_in_minutes",         value: "{{ airflow.dag_spark_analytics.sla }}" }
+  tags: ['test4']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Cassandra INCREMENTAL backup
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: cassandra_bkup_incr
+  with_items:
+    - { key: "{{job}}_schedule_interval", value: "{{ airflow.dag_cassandra_bkup_incr.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",    value: "{{ airflow.dag_cassandra_bkup_incr.sla }}" }
+    - { key: "{{job}}_target_dir",        value: "{{ airflow.dag_cassandra_bkup_incr.target_dir }}" }
+    - { key: "{{job}}_source_dir",        value: "{{ airflow.dag_cassandra_bkup_incr.source_dir }}" }
+    - { key: "{{job}}_mailid",            value: "{{ airflow.dag_cassandra_bkup_incr.mailid }}" }
+    - { key: "{{job}}_user",              value: "{{ airflow.dag_cassandra_bkup_incr.user }}" }
+    - { key: "{{job}}_password",          value: "{{ airflow.dag_cassandra_bkup_incr.password }}" }
+  tags: ['cass_bkups']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Cassandra FULL backup
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: cassandra_bkup_full
+  with_items:
+    - { key: "{{job}}_schedule_interval",  value: "{{ airflow.dag_cassandra_bkup_full.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",     value: "{{ airflow.dag_cassandra_bkup_full.sla }}" }
+    - { key: "{{job}}_target_dir",         value: "{{ airflow.dag_cassandra_bkup_full.target_dir }}" }
+    - { key: "{{job}}_source_dir",         value: "{{ airflow.dag_cassandra_bkup_full.source_dir }}" }
+    - { key: "{{job}}_mailid",             value: "{{ airflow.dag_cassandra_bkup_full.mailid }}" }
+    - { key: "{{job}}_user",               value: "{{ airflow.dag_cassandra_bkup_full.user }}" }
+    - { key: "{{job}}_password",           value: "{{ airflow.dag_cassandra_bkup_full.password }}" }
+  tags: ['cass_bkups']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Cassandra Delete old backups
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: cass_del_old_bkups
+  with_items:
+    - { key: "{{job}}_schedule_interval",      value: "{{ airflow.dag_cass_del_old_bkups.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",         value: "{{ airflow.dag_cass_del_old_bkups.sla }}" }
+    - { key: "{{job}}_path_to_incr",           value: "{{ airflow.dag_cass_del_old_bkups.path_to_incr }}" }
+    - { key: "{{job}}_path_to_full",           value: "{{ airflow.dag_cass_del_old_bkups.path_to_full }}" }
+    - { key: "{{job}}_days_old_incr",          value: "{{ airflow.dag_cass_del_old_bkups.days_old_incr }}" }
+    - { key: "{{job}}_days_old_full",          value: "{{ airflow.dag_cass_del_old_bkups.days_old_full }}" }
+    - { key: "{{job}}_dc1_target_host_incr",   value: "{{ airflow.dag_cass_del_old_bkups.dc1_target_host_incr }}" }
+    - { key: "{{job}}_dc1_target_host_full",   value: "{{ airflow.dag_cass_del_old_bkups.dc1_target_host_full }}" }
+    - { key: "{{job}}_dc2_target_host_incr",   value: "{{ airflow.dag_cass_del_old_bkups.dc2_target_host_incr }}" }
+    - { key: "{{job}}_dc2_target_host_full",   value: "{{ airflow.dag_cass_del_old_bkups.dc2_target_host_full }}" }
+    - { key: "{{job}}_mailid",                 value: "{{ airflow.dag_cass_del_old_bkups.mailid }}" }
+  tags: ['cass_bkups']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Cassandra REPAIR
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: cassandra_repair
+  with_items:
+    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_cassandra_repair.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_cassandra_repair.sla }}" }
+    - { key: "{{job}}_sleep_time_in_minutes", value: "{{ airflow.dag_cassandra_repair.sleep_time_in_minutes }}" }
+  tags: ['test7']
+
+
+##############################################################################
+
+- name: Generate Airflow variables --- Update ML Definitions
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: updateml
+  with_items:
+    - { key: "{{job}}_schedule_interval",        value: "{{ airflow.dag_update_ml_definition.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",           value: "{{ airflow.dag_update_ml_definition.sla }}" }
+    - { key: "{{job}}_email_who_if_ml_updated",  value: "{{ airflow.dag_update_ml_definition.email_who_if_ml_updated }}" }
+    - { key: "{{job}}_s3_conn_id",               value: "{{ airflow.dag_update_ml_definition.s3_conn_id }}" }
+    - { key: "{{job}}_s3_bucket_name",           value: "{{ airflow.dag_update_ml_definition.s3_bucket_name }}" }
+    - { key: "{{job}}_s3_key",                   value: "{{ airflow.dag_update_ml_definition.s3_key }}" }
+    - { key: "{{job}}_ml_file_local_s3",         value: "{{ airflow.dag_update_ml_definition.ml_file_local_s3 }}" }
+    - { key: "{{job}}_ansible_host",             value: "{{ airflow.dag_update_ml_definition.ansible_host }}" }
+    - { key: "{{job}}_ansible_playbook_path",    value: "{{ playbook_dir }}" }
+    - { key: "{{job}}_ansible_cmd_to_update_ml", value: "{{ airflow.dag_update_ml_definition.ansible_cmd_to_update_ml }}" }
+    - { key: "{{job}}_ml_file_prod",             value: "{{ airflow.dag_update_ml_definition.ml_file_prod }}" }
+    - { key: "{{job}}_ml_file_prod_backup",      value: "{{ airflow.dag_update_ml_definition.ml_file_prod_backup }}" }
+  tags: ['test8']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Update ML In-flight
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: updateml_inflight
+  with_items:
+    - { key: "{{job}}_schedule_interval",        value: "{{ airflow.dag_update_ml_inflight.schedule_interval }}" }
+    - { key: "{{job}}_sla_in_minutes",           value: "{{ airflow.dag_update_ml_inflight.sla }}" }
+    - { key: "{{job}}_email_who_if_ml_updated",  value: "{{ airflow.dag_update_ml_inflight.email_who_if_ml_updated }}" }
+    - { key: "{{job}}_s3_conn_id",               value: "{{ airflow.dag_update_ml_inflight.s3_conn_id }}" }
+    - { key: "{{job}}_s3_bucket_name",           value: "{{ airflow.dag_update_ml_inflight.s3_bucket_name }}" }
+    - { key: "{{job}}_s3_key",                   value: "{{ airflow.dag_update_ml_inflight.s3_key }}" }
+    - { key: "{{job}}_ml_file_local_s3",         value: "{{ airflow.dag_update_ml_inflight.ml_file_local_s3 }}" }
+    - { key: "{{job}}_ansible_host",             value: "{{ airflow.dag_update_ml_inflight.ansible_host }}" }
+    - { key: "{{job}}_ansible_playbook_path",    value: "{{ playbook_dir }}" }
+    - { key: "{{job}}_ansible_cmd_to_update_ml", value: "{{ airflow.dag_update_ml_inflight.ansible_cmd_to_update_ml }}" }
+    - { key: "{{job}}_ml_file_prod",             value: "{{ airflow.dag_update_ml_inflight.ml_file_prod }}" }
+    - { key: "{{job}}_ml_file_prod_backup",      value: "{{ airflow.dag_update_ml_inflight.ml_file_prod_backup }}" }
+  tags: ['test9']
+
+##############################################################################
+
+- name: Generate Airflow variables --- Post ML clustering
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: post_ml
+  with_items:
+    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_post_ml.sla }}" }
+    - { key: "{{job}}_spark_cores_max",       value: "{{ airflow.dag_post_ml.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",  value: "{{ airflow.dag_post_ml.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory", value: "{{ airflow.dag_post_ml.spark_executor_memory }}" }
+    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_post_ml.schedule_interval }}" }
+    - { key: "{{job}}_kafka_topic",           value: "{{ airflow.dag_post_ml.kafka_topic }}" }
+    - { key: "{{job}}_kafka_group",           value: "{{ airflow.dag_post_ml.kafka_group }}" }
+    - { key: "{{job}}_kafka_producer_topic",  value: "{{ airflow.dag_post_ml.kafka_producer_topic }}" }
+    - { key: "{{job}}_pipeline_stage",        value: "{{ airflow.dag_post_ml.pipeline_stage }}" }
+    - { key: "{{job}}_representatives_count", value: "{{ airflow.dag_post_ml.representatives_count }}" }
+    - { key: "{{job}}_zk_path",               value: "{{ airflow.dag_post_ml.zk_path }}" }
+  tags: ['test11']
+
+##############################################################################
+
+- name: Generate Airflow variables --- MDN-Relationship
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: mdn_relationship
+  with_items:
+    - { key: "{{job}}_sla_in_minutes",         value: "{{ airflow.dag_mdn_relationship.sla }}" }
+    - { key: "{{job}}_schedule_interval",      value: "{{ airflow.dag_mdn_relationship.schedule_interval }}" }
+    - { key: "{{job}}_spark_cores_max",        value: "{{ airflow.dag_mdn_relationship.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",   value: "{{ airflow.dag_mdn_relationship.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory",  value: "{{ airflow.dag_mdn_relationship.spark_executor_memory }}" }
+    ##- { key: "{{job}}_refresh_cache_duration", value: "{{ airflow.dag_mdn_relationship.refresh_cache_duration }}" }
+
+  tags: ['test12']
+
+##############################################################################
+
+- name: Generate Airflow variables --- MDN-ML-Whitelist
+  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+  vars:
+    - job: mdn_ml_whitelist
+  with_items:
+    - { key: "{{job}}_sla_in_minutes",         value: "{{ airflow.dag_mdn_ml_whitelist.sla }}" }
+    - { key: "{{job}}_schedule_interval",      value: "{{ airflow.dag_mdn_ml_whitelist.schedule_interval }}" }
+    - { key: "{{job}}_spark_cores_max",        value: "{{ airflow.dag_mdn_ml_whitelist.spark_cores_max }}" }
+    - { key: "{{job}}_spark_executor_cores",   value: "{{ airflow.dag_mdn_ml_whitelist.spark_executor_cores }}" }
+    - { key: "{{job}}_spark_executor_memory",  value: "{{ airflow.dag_mdn_ml_whitelist.spark_executor_memory }}" }
+    ##- { key: "{{job}}_refresh_cache_duration", value: "{{ airflow.dag_mdn_ml_whitelist.refresh_cache_duration }}" }
+  tags: ['test13']
+
+##############################################################################
+
+#- name: Generate Airflow variables --- CDR Loader
+#  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+#  vars:
+#    - job: cdrloader
+#  with_items:
+#    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_cdr_loader.schedule_interval }}" }
+#    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_cdr_loader.sla }}" }
+#    - { key: "{{job}}_hostname",              value: "{{ airflow.dag_cdr_loader.hostname }}" }
+#    - { key: "{{job}}_execution_timeout",     value: "{{ airflow.dag_cdr_loader.execution_timeout }}" }
+#  tags: ['test9']
+#
+#
+###############################################################################
+#
+#- name: Generate Airflow variables --- Offline ML
+#  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+#  vars:
+#    - job: offlineml
+#  with_items:
+#    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_offline_ml.schedule_interval }}" }
+#    - { key: "{{job}}_execution_timeout",     value: "{{ airflow.dag_offline_ml.sla }}" }
+#  tags: ['test10']
+#
+###############################################################################
+#
+#- name: Generate Airflow variables --- Clustering Post-ML
+#  shell: 'airflow variables -s "{{ item.key }}" "{{ item.value }}"'
+#  vars:
+#    - job: clusteringml
+#  with_items:
+#    - { key: "{{job}}_schedule_interval",     value: "{{ airflow.dag_clustering_post_ml.schedule_interval }}" }
+#    - { key: "{{job}}_sla_in_minutes",        value: "{{ airflow.dag_clustering_post_ml.sla }}" }
+#  tags: ['test11']
+
+
+#########################################################################################
+#########################################################################################
+
+
+- name: Create user for Airflow UI
+  shell: "{{ airflow.homedir }}/create-airflow-user.py {{ airflow.ui_user }} {{ airflow.ui_password }} && touch created_user_{{ airflow.ui_user }}.txt"
+  args:
+    chdir: "{{ airflow.homedir }}"
+  ignore_errors: true
+
+
+- name: Execute cassandra-repair-pickle.py used for Cassandra repair workflow
+  shell: cd {{ common.shared_storage_path }}/cassandra_airflow.dir/repair.dir && ./cassandra-repair-pickle.py
+  tags: ['pickle']
+
+- name: Create Airflow connection id for S3 (should be readonly)
+  shell: 'airflow connections -a --conn_id "{{ item.conn_id }}" --conn_uri "AWS:" --conn_extra "{{ item.conn_extra }}"'
+  with_items:
+    - { conn_id: "{{ airflow.dag_update_ml_definition.s3_conn_id }}",
+        conn_extra: "{{ airflow.dag_update_ml_definition.s3_conn_extra }}" }
+  no_log: true
+  tags: s3
+
+
+- name: Airflow and systemd
+  template: src={{ item.src }} dest={{ item.dest }}
+  with_items:
+   - { src: "airflow-systemd-webserver.j2", dest: "/etc/systemd/system/airflow-webserver.service" }
+   - { src: "airflow-systemd-scheduler.j2", dest: "/etc/systemd/system/airflow-scheduler.service" }
+  become: true
+  tags: ['airflow_systemd']

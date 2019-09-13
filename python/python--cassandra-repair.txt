@@ -1,0 +1,1004 @@
+#!/usr/bin/python
+
+
+################################
+### Cassandra repair workflow
+################################
+
+
+dag_name = 'rna-cassandra-repair'
+
+
+import pickle
+import datetime
+import sys
+import os
+import subprocess
+import glob
+import re
+import psutil
+import shutil
+import paramiko
+from   shutil import copyfile
+from   datetime import datetime, timedelta
+from   random import shuffle
+from   airflow import DAG
+from   airflow.models import Variable
+from   airflow.operators.bash_operator import BashOperator
+from   airflow.operators.dagrun_operator import TriggerDagRunOperator
+from   airflow.operators.python_operator import ShortCircuitOperator
+from   airflow.operators.python_operator import PythonOperator ## This correct???
+from   airflow.operators.python_operator import BranchPythonOperator  ## This correct???
+from   airflow.operators.dummy_operator import DummyOperator
+from   airflow.utils.trigger_rule import TriggerRule
+
+
+#####################################
+#### Variables to fetch from UI
+#####################################
+
+_nsre = re.compile('([0-9]+)')    ## For sorting the filenames
+schedule_interval =  Variable.get("cassandra_repair_schedule_interval")
+sla = int(Variable.get("cassandra_repair_sla_in_minutes"))
+sleep_time = 'sleep ' + str(Variable.get("cassandra_repair_sleep_time_in_minutes")) + 'm'
+
+
+#######################
+### Other variables
+#######################
+
+##ssh_pre_cmd = 'ssh -A -i ~/.ssh/id_rsa_airflow -o ConnectTimeout=10 -o StrictHostKeyChecking=no ' ## Keep the space at end.
+ssh_pre_cmd = 'ssh -i ~/.ssh/id_rsa_airflow -o ConnectTimeout=10 -o StrictHostKeyChecking=no ' ## Keep the space at end.
+ansible_host = "{{ groups['ansible_host'][0] }}"
+ansible_groups_to_check_repair_on = 'seeds,nonseeds,seedsdc2,nonseedsdc2'
+##ansible_groups_to_check_repair_on = 'airflow_group'
+##cmd_ensure_repair_is_not_running = 'if ps aux | grep -w repai\[r\]; then $(which false); else $(which true); fi'
+cmd_ensure_repair_is_not_running = 'if ps aux | grep \"nodetool repai\[r\]\"; then $(which false); else $(which true); fi'
+##cmd_ensure_repair_is_running = 'ps aux | grep -w repai\[r\]'
+cmd_ensure_repair_is_running = 'ps aux | grep  \"nodetool repai\[r\]\"'
+cmd_ensure_repair = ""
+##ansible_cmd = (
+##    " \"cd {{ playbook_dir }} && ansible " + ansible_groups_to_check_repair_on +
+##    " -i hosts -m raw -a \' " + cmd_ensure_repair + "\'\" "
+##    )
+
+''' repair_cmd = 'repair -pr '  ## Leave a space before close quote '''
+''' repair_cmd = 'repair -pr '  ## Leave a space before close quote '''
+''' repair_cmd = 'repair -pr '  ## Leave a space before close quote '''
+''' repair_cmd = 'repair -pr '  ## Leave a space before close quote '''
+''' repair_cmd = 'repair -pr '  ## Leave a space before close quote '''
+repair_cmd = ' nodetool clearsnapshot && nodetool repair -pr '  ## Leave a space before & after quote
+
+cassandra_dir = '{{ common.shared_storage_path }}/cassandra_airflow.dir'
+repair_dir = cassandra_dir + '/repair.dir'
+template_file = repair_dir + '/repair-template.txt'
+repair_script = repair_dir + '/repair.sh'  ### Will we use the script????
+state_dir = repair_dir + '/state.dir'
+archive_dir = state_dir + '/archive.dir'
+
+##repair_grep_cmd = 'if ps aux | grep -w repai\[r\]; then $(which false); else $(which true); fi'
+##repair_bash_command = 'if ps aux | grep repair.s\[h\]; then $(which false); else $(which true); fi'
+
+
+####################################################################
+### Banner that will appear in the logs and when running manually
+####################################################################
+
+print
+print "##################################"
+print "### Cassandra repair workflow "
+print "##################################"
+print
+
+
+#####################################
+### Default arguments for the DAG
+#####################################
+
+default_args = {
+    'owner': 'Cass-repair',
+    'depends_on_past': False,
+    'start_date': datetime(2018, 12, 1),
+    'email': {{ airflow.dag_failure_email_to }},
+    'email_on_failure': True,
+}
+
+
+##########################
+### Instantiate the DAG
+##########################
+
+dag = DAG(
+    dag_id = dag_name,
+    default_args = default_args,
+    schedule_interval = schedule_interval,
+    catchup = False,
+    orientation = 'graph',
+    max_active_runs = 1,
+    )
+
+
+
+###########################################
+###########################################
+###             Functions
+###########################################
+###########################################
+
+
+####################################
+def store_this(filename,value):
+####################################
+
+    ##os.chdir(cassandra_dir)
+    filename = repair_dir + "/" + filename
+
+    try:
+        with open(filename,'wb') as fileobject:
+            value = pickle.dump(value, fileobject)
+    except:
+        print
+        print '###########################################################'
+        print "Unable to pickle file object"
+        print 'Two incoming variable names: "filename" and "value"'
+        print 'Value of "filename" ==> ', filename
+        print 'Value of "value" ==> ', filename
+        print '###########################################################'
+        print
+
+    return
+
+
+####################################
+def retrieve_this(filename):
+####################################
+
+    ##os.chdir(repair_dir)
+    filename = repair_dir + "/" + filename
+    with open(filename,'rb') as fileobject:
+        value = pickle.load(fileobject)
+    return value
+
+
+#########################################
+def func_fail_the_workflow(function):
+#########################################
+
+    print
+    print "##########################################################"
+    print 'Received request to terminate workflow from function:'
+    print '====> "{}"'.format(function)
+    print "##########################################################"
+    print
+
+    assert 1 == 2
+
+
+#########################################
+def func_on_failure_callback(context):
+#########################################
+
+    current_filename = retrieve_this('current_filename')
+    current_host = retrieve_this('current_host')
+    assert current_filename
+    assert current_host
+    print
+    print '###########################################################################'
+    print '##### Now executing function "func_on_failure_callback"'
+    print '#####'
+    print '##### current_filename ==> "{}"'.format(current_filename)
+    print '##### current_host ==> "{}"'.format(current_host)
+    print '#####'
+    print '##### Will request suffix change of the current_file (above) to "failed"'
+    print '###########################################################################'
+    print
+    func_change_state(retrieve_this('current_filename'),'failed')
+
+
+#################################################
+def func_repair_not_actually_running(context):
+#################################################
+
+    print
+    print "##############################################################################"
+    print "There's a file with the 'running' suffix in:"
+    print state_dir
+    print "But can't verify the Cassandra repair is actually running"
+    print 'Check Airflow UI: "RNA Cassandra Repair" => "Status of Repair (holistic view)"'
+    print "##############################################################################"
+    print
+
+
+###############################################################
+def func_create_dir_with_filenames():
+###############################################################
+
+    ''' Although the directory should be empty (files having been
+        archived to archived_dir), taking no chances '''
+    for filename in os.listdir(state_dir):
+        file_path = os.path.join(state_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+            ###elif os.path.isdir(file_path):
+            ###    shutil.rmtree(file_path)
+        except Exception as e:
+            print(e)
+
+    ''' Create state files based on contents of template_file '''
+    os.chdir(state_dir)
+    filelist = open(template_file,'r')
+    for line in filelist:
+        open(line.strip(),'a').close()
+
+
+
+#############################
+def natural_sort_key(s):
+#############################
+
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(_nsre, s)]
+
+
+
+#####################################
+def func_get_next_node_to_submit():
+#####################################
+
+    try:
+        os.chdir(state_dir)
+        print
+        print "#############################################"
+        print "Current working directory:"
+        print os.getcwd()
+        print
+        ##print os.listdir('.')
+    except:
+        print "#############################################"
+        print
+        if os.getcwd() != state_dir:
+            print "Unable to switch to {0}".format(state_dir)
+            print "Termination..."
+            print
+            func_fail_the_workflow('func_get_next_node_to_submit')
+
+
+    if glob.glob('./*::notstarted'):
+
+        ##current_filename   = sorted(glob.glob('*::notstarted'))[0]
+        notstarted = glob.glob('*::notstarted')
+        notstarted.sort(key=natural_sort_key)
+        current_filename   = notstarted[0]
+
+        current_number     = current_filename.split('::')[0]
+        current_datacenter = current_filename.split('::')[1]
+        current_grouping   = current_filename.split('::')[2]
+        current_host       = current_filename.split('::')[3]
+        current_keyspace   = current_filename.split('::')[4]
+        current_table      = current_filename.split('::')[5]
+        current_state      = current_filename.split('::')[6]
+
+        store_this('current_filename', current_filename)
+        store_this('current_number', current_number)
+        store_this('current_datacenter', current_datacenter)
+        store_this('current_grouping', current_grouping)
+        store_this('current_host', current_host)
+        store_this('current_keyspace', current_keyspace)
+        if current_table.upper() == 'ALL':
+            current_table = " "
+        store_this('current_table', current_table)
+        store_this('current_state', current_state)
+        return
+    else:
+        print 'Unable to find files with suffix "::notstarted"'
+        print "Terminating..."
+        print
+        func_fail_the_workflow('func_get_next_node_to_submit')
+
+
+############################################
+def func_change_state(filename,new_state):
+############################################
+
+    '''
+    This step receives a single "filename" in the format below.
+    (The actual file that "filename" refers to has no content; what matters is its name.)
+
+    This step receives only one, but here are several examples of the incoming "filename":
+      001::dallas::001::10.164.151.18::htm_db::analyzed_routes_daily::notstarted
+      002::dallas::001::10.164.151.19::htm_db::analyzed_routes_daily::notstarted
+      003::dallas::001::10.164.151.20::htm_db::analyzed_routes_daily::notstarted
+      ...
+      272::dallas::068::10.164.151.21::system_auth::ALL::notstarted
+      .
+      .
+      .
+      273::chicago::001::10.166.151.18::htm_db::analyzed_routes_daily::notstarted
+      ...
+      544::chicago::068::10.166.151.21::system_auth::ALL::notstarted
+    '''
+
+    print
+    print "#########################################################################################"
+    print "(1 of 2)"
+    print
+    print 'Executing "func_change_state"'
+    print "Two variables coming in as input:"
+    print '--The "filename" (which we\'re operating on) ==> ', filename
+    print '--The "new_state" (which will change the above file suffix) ==> ', new_state
+    print "#########################################################################################"
+    print
+
+    number,datacenter,grouping,host,keyspace,table,state = filename.split("::")
+    new_filename = "::".join([number,datacenter,grouping,host,keyspace,table,new_state])
+
+    try:
+        os.chdir(state_dir)
+        os.rename(filename, new_filename)
+        print "####################################################"
+        print "(2 of 2)"
+        print
+        print 'Successfully renamed ...'
+        print '\t"{}"'.format(filename)
+        print "to:"
+        print '\t"{}"'.format(new_filename)
+        print 'inside this current directory  ==> ', os.getcwd()
+        print "####################################################"
+        print
+    except:
+        print
+        print "####################################################"
+        print "###################   FAILED    ####################"
+        print "####################################################"
+        print
+        print 'Failed to renamed ...'
+        print '\t"{}"'.format(filename)
+        print "to:"
+        print '\t"{}"'.format(new_filename)
+        print 'inside this current directory  ==> ', os.getcwd()
+        print "####################################################"
+        print
+        func_fail_the_workflow('func_change_state')
+
+    ##store_this('current_filename', filename)
+    store_this('current_filename', new_filename)
+    store_this('current_number', number)
+    store_this('current_datacenter', datacenter)
+    store_this('current_grouping', grouping)
+    store_this('current_host', host)
+    store_this('current_keyspace', keyspace)
+    if table.upper() == 'ALL':
+       table = " "
+    store_this('current_table', table)
+    store_this('current_state', new_state)
+
+    return
+
+
+#################################################
+def func_archive_one_repair_cycle():
+#################################################
+
+    try:
+        os.chdir(state_dir)
+    except:
+        print
+        print "##########################################################"
+        print "###   Can't get to path ==> ".format(state_dir)
+        print "##########################################################"
+        print
+        func_fail_the_workflow('func_archive_one_repair_cycle')
+
+    if not os.path.exists(archive_dir):
+        os.makedirs(archive_dir)
+
+    source = (glob.glob(state_dir + '/*::*'))
+    if len(source) > 0:
+        try:
+            dest = archive_dir + "/" + datetime.now().strftime("%Y-%m-%d-%H-%M")
+            os.makedirs(dest)
+            for filename in source:
+                shutil.move(filename, dest)
+        except:
+            print
+            print 'Done with a Repair cycle, but unable to move files from directory:'
+            print '==> ', state_dir
+            print 'into directory'
+            print '==> ', archive_dir
+            print
+            func_fail_the_workflow('func_archive_one_repair_cycle')
+
+
+##############################################
+def func_run_remote_bash_command(hostname,command):
+##############################################
+
+    ##bash_command = ssh_pre_cmd +  str(hostname) + " \"bash -s\" " + " < " + command
+    bash_command = ssh_pre_cmd +  str(hostname) + " " + command + " "
+
+    print
+    print "############### Will execute command below on ({}):  ".format(hostname)
+    print bash_command
+    print "##################################################"
+    print
+
+    subprocess.check_output(bash_command, shell=True, stderr=subprocess.STDOUT)
+
+
+##############################################
+def func_launch_repair():
+##############################################
+
+    ##bash_command = ssh_pre_cmd +  str(hostname) + " \"bash -s\" " + " < " + command
+    ##bash_command = ssh_pre_cmd + " " +  str(hostname) + " " + command
+
+    current_host = retrieve_this('current_host') + " "
+    current_keyspace = retrieve_this('current_keyspace') + " "
+    current_table = retrieve_this('current_table') + " "  ### This should be black of set to "ALL" keyspaces
+
+
+
+    bash_command = ssh_pre_cmd +  str(current_host) + " \" " + repair_cmd + current_keyspace + current_table + " \" "
+
+    print
+    print "############### Will execute command below on ({}):  ".format(current_host)
+    ##print "############### Will execute command below on ({}):  ".format(current_host)
+    print bash_command
+    print "##################################################"
+    print
+
+    subprocess.check_output(bash_command, shell=True, stderr=subprocess.STDOUT)
+
+
+####################################################################
+'''############### Here's where the action starts ###############'''
+### Begin by evaluating empty files whose name is the only thing
+### that matters. Each corresponds to the name of each of the nodes
+### currently part of the Cassandra cluster and the state of the
+### the backup for that node. There will be a signle file per node.
+'''############### Here's where the action starts ###############'''
+####################################################################
+
+
+################################
+def func_determine_state():
+################################
+
+    #################################################################################
+    ### This function will "determine_state" -- that is, what course of action will
+    ### be taken based on the contents of "filenames_list"
+    ### It will then return an appropriate task_id that follows a given path.
+    #################################################################################
+
+
+    ###################
+    ### IF GREENFIELD
+    ###################
+    ### The workflow will follow this path when no files exist in "state_dir" or
+    ### when all the files in "state_dir" end with the prefix "succeeded"
+
+    pattern = "*::*"  ## All files should have 7 fields with delimeter being "::"
+
+    if not os.path.exists(state_dir):
+       os.makedirs(state_dir)
+       os.chdir(state_dir)
+       return 'if_greenfield'
+    else:
+        os.chdir(state_dir)
+        if len(glob.glob(pattern)) == 0:
+            print
+            print '######################################################################'
+            print '##### Found no files with correct format in directory:'
+            print ' "{0}"'.format(state_dir)
+            print '##### DETERMINING TO TAKE WORKFLOW PATH ====> "if_greenfield"'
+            print '######################################################################'
+            print
+            return 'if_greenfield'
+
+
+    ##################################################
+    ### If the "state_dir" exists and has content,
+    ### list the files in "state_dir". Practical???
+    ##################################################
+    os.chdir(state_dir)
+    filenames_list = glob.glob(pattern)
+    filenames_string = ",".join(filenames_list)
+    print
+    print "#############################################################"
+    ##print "Variable 'pattern' ==> ", pattern
+    ##print
+    print "Files in working dir with pattern ==> ",pattern
+    ##for file in os.listdir('.'):
+    ##    print "\t", file
+    print
+    print "After 'glob.glob(pattern)': "
+    print "\tVariable 'filenames_list' ===> ", filenames_list
+    ##print "\tVariable 'filenames_string' ===> ", filenames_string
+    print "#############################################################"
+    print
+
+
+    ################
+    ### IF FAILED
+    ################
+
+    ### The workflow will follow this path when a file exists in "state_dir" with the
+    ### suffix "failed". There should not be more than one!!!
+    if '::failed' in filenames_string:
+        print
+        print '######################################################################'
+        print '##### Found file with the suffix "failed"'
+        print '##### DETERMINING TO TAKE PATH ====> "if_failed"'
+        print '######################################################################'
+        print
+        return 'if_failed'   ### The next DAG "task_id" to execute
+
+
+    ################
+    ### IF RUNNING
+    ################
+
+    ### The workflow will follow this path when a file exists in "repair_dir" with
+    ### the suffix "running". There should not be more than one. The workflow will verify and expect
+    ### a "repair" job to be running. If it isn't, the workflow will fail as there's clearly something wrong.
+    ### It will also verify that only one repair is running. Otherwise, failure.
+    ###
+    elif '::running' in filenames_string:
+
+        os.chdir(state_dir)
+        filenames_list = glob.glob('*::running*')
+
+        if len(filenames_list) != 1:
+            print
+            print "####################################################################"
+            print "##### Expecting only one file in a 'running' state!!! Got ==> ", len(filenames_list)
+            for filename in filenames_list:
+                print "#####    This ====> ", filename
+            print "####################################################################"
+            print
+            func_fail_the_workflow('func_determine_state')
+        else:
+            ''' ?????????????????????? '''
+            ##incr,jobname,host,state=filenames_list[0].split("::")
+            ##current_host = store_this('current_host',host)
+            ##print "current_host ==> ", current_host
+            ''' ?????????????????????? '''
+
+            print
+            print '#########################################################'
+            print '##### Found a file with the suffix  ====> "::running" '
+            print '##### DETERMINING TO TAKE PATH ====> "if_running"'
+            print '#########################################################'
+            print
+            return 'if_running'   ### The next DAG "task_id" to execute
+
+    else:
+        #####################################################
+        ### ALL SUCCEEDED (determine if they in fact did)
+        ### Do some counting.
+        ### NEED TO TAKE INTO ACCOUNT THE "::skipped" !!!!
+        #####################################################
+
+        ### The workflow will follow this path when all files in the "repair_dir" end with
+        ### the suffix "succeeded". It will rename the "repair_dir" with a timestamp suffix
+        ### and will create a new directory with the same name as the original "repair_dir".
+        ###
+
+        print
+        print "#############################################################"
+        print "Variable 'filenames_list' ===> ", filenames_list
+        print "Variable 'filenames_string' ===> ", filenames_string
+        print "#############################################################"
+        print
+        total_files = len(filenames_list)
+        total_succeeded = 0
+
+        # To determine if all nodes succeeded, compare the number of files to the
+        # number of occurrences of the word "succeeded" (one occurrence per file).
+        # That is, if we have 5 active Cassandra nodes, we should have 5 files,
+        # all ending with the suffix "succeeded". This would "prove" that all repairs succeeded.
+        for filename in filenames_list:
+            ##incr,jobname,host,state=filename.split("::")
+            number,datacenter,grouping,host,keyspace,table,state=filename.split("::")
+            if state == 'succeeded' or state == 'skipped':
+                total_succeeded += 1
+
+        if total_succeeded == total_files:
+            print
+            print "##### Found that all files had the suffix '::succeeded' or '::skipped' "
+            print "##### Therefore..."
+            print "##### DETERMINING TO TAKE PATH ====> 'if_all_succeeded'"
+            print
+            return 'if_all_succeeded' ### The next DAG "task_id" to be executed
+
+
+        #################
+        ### NOTSTARTED
+        #################
+
+        ### The workflow will follow this path when it looks inside the "state_dir" and finds:
+        ###     1) that it's populated with files,
+        ###     1) that no files exist with the "failed" suffix,
+        ###     2) that no files exist in with the "running" suffix,
+        ###     3) that at least one file exists with the "notstarted" suffix.
+        ### If so, then...
+
+        elif '::notstarted' in filenames_string:
+
+            ##current_filename   = sorted(glob.glob('*::notstarted'))[0]
+            notstarted = glob.glob('*::notstarted')
+            notstarted.sort(key=natural_sort_key)
+            current_filename = notstarted[0]
+
+            current_number     = current_filename.split('::')[0]
+            current_datacenter = current_filename.split('::')[1]
+            current_grouping   = current_filename.split('::')[2]
+            current_host       = current_filename.split('::')[3]
+            current_keyspace   = current_filename.split('::')[4]
+            current_table      = current_filename.split('::')[5]
+            current_state      = current_filename.split('::')[6]
+
+            store_this('current_filename', current_filename)
+            store_this('current_number', current_number)
+            store_this('current_datacenter', current_datacenter)
+            store_this('current_grouping', current_grouping)
+            store_this('current_host', current_host)
+            store_this('current_keyspace', current_keyspace)
+            store_this('current_table', current_table)
+            store_this('current_state', current_state)
+            print
+            print "##### Found file with the suffix '::notstarted' "
+            print "##### DETERMINING TO TAKE PATH ====> 'if_launch_next_repair'"
+            print
+            return 'if_launch_next_repair'   ### The next DAG "task_id" to execute
+
+        else:
+            print
+            print
+            print "##################################################################"
+            print "##################################################################"
+            print "##################################################################"
+            print "Problem!!! Unable to find files with expected suffix."
+            print "File format example: "
+            print "<incremental-number>::<datacenter>::<grouping-number>::<ip-or-host>::<keyspace>::notstarted"
+            print
+            print "Was expecting to find one of these suffixes:"
+            print "    1) *notstarted"
+            print "    2) *running"
+            print "    3) *succeeded"
+            print "    4) *failed"
+            print "    4) *skipped"
+            print "    5) Or an empty directory here ==> ", state_dir
+            print
+            print "But in that directory, instead found this: "
+            for file in sorted(filenames_list):
+                print "\t", file
+            print "##################################################################"
+            print "##################################################################"
+            print "##################################################################"
+            print
+            print
+            func_fail_the_workflow('func_determine_state')   ### If none of the above conditions match, fail workflow
+
+
+################################################################################################
+################################################################################################
+################################################################################################
+
+branching = BranchPythonOperator(
+    task_id='determine_state',   ### This will determine what action to take.
+    python_callable=func_determine_state,
+    dag=dag,
+    )
+'''check_time >> branching'''
+
+################################################################################################
+################################################################################################
+################################################################################################
+
+
+####################
+### IF_GREENFIELD
+####################
+
+if_greenfield = DummyOperator(
+    task_id='if_greenfield',
+    dag=dag,
+    )
+
+cmd_ensure_repair = cmd_ensure_repair_is_not_running  ## This gets fed into Ansible command
+ansible_cmd = (
+    " \"cd {{ playbook_dir }} && ansible " + ansible_groups_to_check_repair_on +
+    " -i hosts -m raw -a \' " + cmd_ensure_repair + "\'\" "
+    )
+greenfield_so_fail_if_repair_already_running = PythonOperator(
+    task_id='greenfield_so_fail_if_repair_already_running',
+    python_callable=func_run_remote_bash_command,
+    op_args=[ansible_host, ansible_cmd],
+    dag=dag,
+    )
+
+### function requires 'cassandra_active_nodes set by "func_get_cassandra_active_nodes" (above)
+### Sets variable "current_filename"
+greenfield_so_create_dir_with_filenames = PythonOperator(
+    task_id='greenfield_create_dir_with_filenames',
+    python_callable=func_create_dir_with_filenames,
+    dag=dag,
+    )
+
+### Sets and returns "current_host" & "current_filename"
+greenfield_so_get_next_node_to_submit = PythonOperator(
+    task_id='greenfield_get_next_node_to_submit',
+    python_callable=func_get_next_node_to_submit,
+    dag=dag,
+    )
+
+greenfield_so_change_state_to_running = PythonOperator(
+    task_id='greenfield_change_state_to_running',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'running'],
+    dag=dag,
+    )
+
+
+greenfield_so_launch_new_repair = PythonOperator(
+    task_id='greenfield_launch_next_repair',
+    python_callable=func_launch_repair,
+    ##op_args=['current_host','current_keyspace','current_table','repair_cmd'],
+    on_failure_callback=func_on_failure_callback,
+    dag=dag,
+    )
+
+greenfield_now_change_state_to_succeeded = PythonOperator(
+    task_id='greenfield_now_change_state_to_succeeded',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'succeeded'],
+    dag=dag,
+    )
+
+greenfield_succeeded_so_sleep = BashOperator(
+    task_id='greenfield_sleep_after_repair_succeeds',
+    bash_command=sleep_time,
+    dag=dag,
+    )
+
+with dag:
+    (
+        branching
+        >> if_greenfield
+        >> greenfield_so_fail_if_repair_already_running
+        ##>> greenfield_so_get_cassandra_active_nodes
+        >> greenfield_so_create_dir_with_filenames
+        >> greenfield_so_get_next_node_to_submit
+        >> greenfield_so_change_state_to_running
+        >> greenfield_so_launch_new_repair
+        >> greenfield_now_change_state_to_succeeded
+        >> greenfield_succeeded_so_sleep
+    )
+
+
+################
+### IF_FAILED
+################
+'''(if any files exist in "repair_dir" with "failed" suffix)'''
+
+if_failed = DummyOperator(
+    task_id='if_failed',
+    dag=dag,
+    )
+
+failed_template = '''
+echo
+echo '################################################'
+echo '#### PREVIOUS \"repair\" SEEMS TO HAVE FAILED'
+echo '#### PREVIOUS \"repair\" SEEMS TO HAVE FAILED'
+echo '#### PREVIOUS \"repair\" SEEMS TO HAVE FAILED'
+echo '################################################'
+echo && $(which false)
+'''
+
+failed_but_please_verify = BashOperator(
+    task_id='prev_run_failed_but_please_verify',
+    bash_command=failed_template,
+    dag=dag,
+    )
+
+with dag:
+    (
+        branching
+        >> if_failed
+        >> failed_but_please_verify
+    )
+
+
+######################
+###  IF_RUNNING
+######################
+
+### Verify "repair" is actually running. If not, it might mean it crapped out before
+### it was able to execute the task that changes the state from "running" to
+### either "succeeded" or "failed"
+
+if_running = DummyOperator(
+    task_id='if_running',
+    dag=dag,
+    )
+
+
+cmd_ensure_repair = cmd_ensure_repair_is_running  ## This gets fed into Ansible command
+ansible_cmd = (
+    " \"cd {{ playbook_dir }} && ansible " + ansible_groups_to_check_repair_on +
+    " -i hosts -m raw -a \' " + cmd_ensure_repair + "\'\" "
+    )
+running_repair_but_verifying = PythonOperator(
+    task_id='running_file_so_fail_if_not_running_repair',
+    python_callable=func_run_remote_bash_command,
+    op_args=[ansible_host, ansible_cmd],
+    on_failure_callback=func_repair_not_actually_running, ### Complain that repair NOT running
+    dag=dag,
+    )
+
+
+running_verified = DummyOperator(
+    task_id='verified_repair_is_running',
+    dag=dag,
+    )
+
+with dag:
+    (
+        branching
+        >> if_running
+        >> running_repair_but_verifying
+        >> running_verified
+    )
+
+
+#########################
+### IF ALL SUCCEEDED
+#########################
+
+if_all_succeeded = DummyOperator(
+    task_id='if_all_succeeded',
+    dag=dag,
+    )
+
+all_succ_so_rename_cassandra_repair_dir = PythonOperator(
+    task_id='all_succ_rename_cassandra_repair_dir',
+    python_callable=func_archive_one_repair_cycle,
+    dag=dag,
+    )
+
+all_succ_so_create_dir_with_filenames = PythonOperator(
+    task_id='all_succ_create_dir_with_filenames',
+    python_callable=func_create_dir_with_filenames,
+    dag=dag,
+    )
+
+cmd_ensure_repair = cmd_ensure_repair_is_not_running  ## This gets fed into Ansible command
+ansible_cmd = (
+    " \"cd {{ playbook_dir }} && ansible " + ansible_groups_to_check_repair_on +
+    " -i hosts -m raw -a \' " + cmd_ensure_repair + "\'\" "
+    )
+all_succ_but_fail_if_repair_already_running = PythonOperator(
+    task_id='all_succ_but_fail_if_repair_already_running',
+    python_callable=func_run_remote_bash_command,
+    op_args=[ansible_host, ansible_cmd],
+    dag=dag,
+    )
+
+all_succ_so_get_next_node_to_submit = PythonOperator(
+    task_id='all_succ_get_next_node_to_submit',
+    python_callable=func_get_next_node_to_submit,
+    dag=dag,
+    )
+
+all_succ_so_change_state_to_running = PythonOperator(
+    task_id='all_succ_change_state_to_running',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'running'],
+    on_failure_callback=func_on_failure_callback,
+    dag=dag,
+    )
+
+all_succ_so_launch_new_repair = PythonOperator(
+    task_id='all_succ_launch_next_repair',
+    python_callable=func_launch_repair,
+    ##op_args=[retrieve_this('current_host'),command],
+    on_failure_callback=func_on_failure_callback,
+    dag=dag,
+    )
+
+all_succ_so_change_state_to_succeeded = PythonOperator(
+    task_id='all_succ_change_state_to_succeeded',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'succeeded'],
+    dag=dag,
+    )
+
+all_succ_so_sleep_if_successful = BashOperator(
+    task_id='all_succ_sleep_after_repair_succeeds',
+    bash_command=sleep_time,
+    dag=dag,
+    )
+
+with dag:
+    (
+        branching
+        >> if_all_succeeded
+        >> all_succ_so_rename_cassandra_repair_dir
+        ##>> all_succ_so_get_cassandra_active_nodes
+        >> all_succ_so_create_dir_with_filenames
+        >> all_succ_but_fail_if_repair_already_running
+        >> all_succ_so_get_next_node_to_submit
+        >> all_succ_so_change_state_to_running
+        >> all_succ_so_launch_new_repair
+        >> all_succ_so_change_state_to_succeeded
+        >> all_succ_so_sleep_if_successful
+    )
+
+
+################################
+### LAUNCH A NEW REPAIR TASK
+################################
+
+if_launch_next_repair = DummyOperator(
+    task_id='if_launch_next_repair',
+    dag=dag,
+    )
+
+cmd_ensure_repair = cmd_ensure_repair_is_not_running  ## This gets fed into Ansible command
+ansible_cmd = (
+    " \"cd {{ playbook_dir }} && ansible " + ansible_groups_to_check_repair_on +
+    " -i hosts -m raw -a \' " + cmd_ensure_repair + "\'\" "
+    )
+fail_if_repair_already_running = PythonOperator(
+    task_id='fail_if_repair_already_running',
+    python_callable=func_run_remote_bash_command,
+    op_args=[ansible_host,ansible_cmd],
+    dag=dag,
+    )
+
+change_to_running = PythonOperator(
+    task_id='change_to_running_state',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'running'],
+    dag=dag,
+    )
+
+run_repair = PythonOperator(
+    task_id='run_repair',
+    python_callable=func_launch_repair,
+    ##op_args=[current_host,current_keyspace,current_table,repair_cmd],
+    on_failure_callback=func_on_failure_callback,
+    dag=dag,
+    )
+
+change_state_to_succeeded = PythonOperator(
+    task_id='change_state_to_succeeded',
+    python_callable=func_change_state,
+    op_args=[retrieve_this('current_filename'),'succeeded'],
+    dag=dag,
+    )
+
+sleep_if_successful = BashOperator(
+    task_id='sleep_if_successful',
+    bash_command=sleep_time,
+    dag=dag,
+    )
+
+with dag:
+    (
+        branching
+        >> if_launch_next_repair
+        >> fail_if_repair_already_running
+        >> change_to_running
+        >> run_repair
+        >> change_state_to_succeeded
+        >> sleep_if_successful
+    )
+
+
+###################
+###  End of code
+###################

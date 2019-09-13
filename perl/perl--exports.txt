@@ -1,0 +1,516 @@
+#!/usr/local/bin/perl 
+
+
+#######################
+### Author: Juan Sena
+#######################
+
+#####################################################################
+# This script identifies tapes used between the specified savetimes,
+# and ejects these tapes into the Tape library CAP.
+#####################################################################
+
+
+#############################
+### Must run script as root
+#############################
+
+unless ($ENV{LOGNAME} eq "root") {
+    print "\n#\n#\n#\t\t*** Must run as root ***\n#\n#\n#\n\n" ;
+    exit ;
+}
+
+$jukebox=$ARGV[0] ;
+$scsidev = qx [ /nsr/scripts/get_jukebox_address|grep -w $jukebox|tr -d ';'|awk '{print \$5}' ];
+
+###############
+###  Banner
+###############
+$banner = '/bin/banner' ; 
+@banner = `$banner " $jukebox" ; $banner "export"` ; 
+print @banner ; 
+print "\nPlease wait...\n\n" ; 
+
+
+##########################################
+### Set Some Environment Variables
+##########################################
+
+chomp($host = `uname -n `) ; 
+$days_ago = 2 ; #export tapes older than "$days_ago" ; 
+$nwpath="/usr/sbin:/etc/LGTOuscsi:/usr/bin/";    # Path to NetWorker binaries
+$ENV{"PATH"} .= ":${nwpath}";   # Append $nwpath to active path
+$base = '/nsr/scripts' ;
+$export_script_errors = "$base/daily_export_script_errors_$jukebox" ;
+$export_tape_list = "$base/daily_export_tape_list_$jukebox" ;
+@barcode_list = () ; 
+%tapes_list = () ; 
+
+number_of_tapes_to_export() ; 
+
+@read_only = `mminfo -q readonly,location=$jukebox -r volume,pool,%used,written 2>/dev/null|nl -bp'[0-9][0-9]'` ;
+@read_only = undef if grep {/no matches found/} @read_only ; 
+
+if (scalar @read_only > 0) {
+    print "\n\n" ; 
+    print "###################################################################\n" ;
+    print "The following tapes are marked read-only and will NOT be exported:\n\n" ; 
+    print "@read_only" ;  
+    print "###################################################################\n" ;
+}
+
+enter_box_number() ; 
+
+
+###################################################################
+### Get BOX number
+###################################################################
+
+
+######################################### 
+### START subroutine "enter_box_number"
+######################################### 
+sub enter_box_number {
+
+        ####################
+        ## Enter box number
+        ####################
+        print "\nEnter a BOX NUMBER: "  ;
+        chomp($box_number = <STDIN>) ;
+
+        #####################
+        ## Is it 6 digits ?
+        #####################
+        unless ( $box_number !~ /\w{2,10}/) {
+            print "\n########################\n" ; 
+            print "You entered: $box_number" ; 
+            print "\n########################\n" ; 
+
+            ############################
+            ### Is box number correct?
+            ############################
+            print "Is this correct? (y/n):" ; 
+            chomp($answer = <STDIN>) ; 
+            if ($answer =~ /^y/i) {
+                print "\nProceeding...\n\n" ;
+                return ; 
+            }else{
+                enter_box_number() ; 
+            }
+        }else{
+                enter_box_number() ; 
+        }
+}
+######################################### 
+### END subroutine "enter_box_number" 
+######################################### 
+
+#
+# Verify that the CAP is empty before we start...
+#
+
+print "\n##################################################\n";
+print "Verifying that the CAP is empty before we begin...";
+print "\n##################################################\n";
+
+
+read_labels() ; 
+
+
+###########################################
+### Start subroutine "read_labels"
+###########################################
+sub read_labels {
+    $sjirdtag_cmd="sjirdtag $scsidev";
+    unless (open(SJIRDTAG, "$sjirdtag_cmd|")) {
+            die "unable to open \'sjirdtag\' command pipe\n";
+    }
+
+    while (<SJIRDTAG>) {
+            if (/full=1/) {         # if this matches, we know the barcode is next...
+                    $_ = <SJIRDTAG>;        # so read the barcode!
+                    if (/VolumeTag\=\<(\w{6,6})/) { # get the 6 alphanumeric character label
+                        push(@barcode_list,$1); # and add it to our list of labels in CAP
+                        #chomp $1 ; 
+                    }
+            }
+    }
+}
+###########################################
+### End subroutine "read_labels" 
+###########################################
+
+
+
+if (@barcode_list) {
+        print "\n\nFound these tapes already in the $host [$jukebox] CAP:\n" ; 
+        map{print "$_\n"}@barcode_list ; 
+        print "\nPlease remove them and rerun this script...\n\n" ; 
+        die "\n\t*** Exiting ***\n\n\n" ;
+}
+
+#
+# Set mminfo query to find all tapes (as described above) in the 'DB Pool' and 'Default' pool
+#
+
+
+##################################################
+### Start subroutine "number_of_tapes_to_export" 
+##################################################
+sub number_of_tapes_to_export {
+ 
+    ###################################
+    ### Get list of tapes to be export
+    ###################################
+
+  
+       ###$mminfo_cmd="mminfo -q location=$jukebox,'!readonly','savetime>5000 days ago','savetime<$days_ago days ago 13:59:00' -r volume" ; 
+       $mminfo_cmd="mminfo -q location=$jukebox,'!readonly','savetime<=$days_ago days ago 17:00:00' -r volume" ; 
+
+    unless (open(MMINFO, "$mminfo_cmd -- 2> /dev/null |")) {
+        die "unable to open \'mminfo\' command pipe\n";
+    }
+    chomp(@volumes = <MMINFO>) ; 
+
+    #####################################################
+    ### If NO tapes are to be exported, say so and exit. 
+    #####################################################
+    if (!defined(@volumes)) { 
+        print "\n\n\n**************************\n" ; 
+        print "*   No Tapes to Export   *\n" ;  
+        print "**************************\n\n\n" ; 
+        exit (1) ; 
+    }
+
+    ################################################
+    ### If tapes ARE to be exported, tell how many.
+    ################################################
+    ##@volumes = sort {$a <=> $b} @volumes ; 
+    @volumes = sort {$a cmp $b} @volumes ; 
+    open (VOLUMES,">$export_tape_list") or die "Unable to create/overwrite $export_tape_list: $?" ; 
+    map { print VOLUMES "$_\n" } @volumes ; 
+    close (VOLUMES) ; 
+    print "\t**************************\n" ;
+    print "\t*   Total volumes = ", scalar @volumes, "   *\n" ;
+    print "\t**************************\n" ;
+
+
+###################################################
+} ###  End subroutine "number_of_tapes_to_export"
+###################################################
+
+
+
+#####################################
+### Put all tapes into hash with
+### default value "not exported"
+#####################################
+foreach (@volumes) { $tapes_list{$_} = 'not exported'} ;
+
+
+# Start by setting the port polling period within the NetWorker Media/Jukeboxes 
+# resource to "0" (infinite timeout) so that if CAP becomes full other tapes to 
+# be ejected will queue until the CAP has been emptied.
+#
+
+`/bin/echo ". NSR jukebox" >/tmp/.commands`;
+`/bin/echo "update port polling period: 0" >>/tmp/.commands`;
+#print "\n\nTemporarily setting the jukebox 'port polling interval' to 0\n";
+`nsradmin -i /tmp/.commands`;
+
+#
+# Unload all drives which are not currrently being written to
+#
+
+
+##print "\n\n#########################################\n" ; 
+##print "Unloading all tapes from drives...\n" ; 
+##`nsrjb -u -j $jukebox -q -- 2> $export_script_errors`;
+##print "Done unloading." ; 
+##print "\n#########################################\n\n" ; 
+
+#
+# Run through resultant volume list and eject them one-by-one in groups of 20 
+# (the maximum CAP capacity)
+#
+
+######################### redo #########################
+##$mminfo_cmd="mminfo -q location=$jukebox,'!readonly',\%used=full,'savetime>5000 days ago 14:00:00',\"savetime< $days_ago days ago 13:59:00\",pool='Default',pool='ORACLEDB',pool='EXCHDB',pool='DB Pool' -r volume";
+##unless (open(MMINFO, "$mminfo_cmd|")) {
+##        die "unable to open \'mminfo\' command pipe\n";
+##}
+########################################################
+##$counter = 0 ; 
+$total_exported = 0 ; 
+
+
+###########################################
+###########################################
+###########################################
+### Trapping Ctl-C
+###
+$SIG{INT} = \&assign_new_location ; 
+###
+###
+###########################################
+###########################################
+###########################################
+
+
+###########################################
+### START subroutine "assign_new_location"
+###########################################
+sub assign_new_location {
+    print "\a" x 30; 
+    print "\n\n###############################################################\n" ; 
+    print "Before dying, I'll try to assign box location to exported tapes.\n" ; 
+    print "But you may have to do the last one manually via nwadmin - check.\n" ; 
+    print "###############################################################\n\n" ; 
+    die "\n\n\t*** No tapes were assigned to Box_$box_number ***\n\n\n" if scalar @tapes_already_exported == 0 ; 
+
+    print "\n\n################################################\n" ;
+    print "Assigning new location to tapes...\n" ;
+    print "################################################\n" ;
+    $counter = 1 ;
+
+    foreach (@tapes_already_exported) {
+        /(\b\w{6,6}\b)/ ;
+        print "$counter   Changing location of tape $1 to Box_$box_number\n" if $counter < 10 ;
+        print "$counter  Changing location of tape $1 to Box_$box_number\n" if $counter > 9 and $counter < 100;
+        print "$counter Changing location of tape $1 to Box_$box_number\n" if $counter > 99 ;
+        `mmlocate -u -n $1 "Box_$box_number" 2>> $export_script_errors` ;
+        $counter++ ;
+    }
+
+    ##################################################
+    ## Kill any and all "nsrjb -w" commands leftover
+    ##################################################
+    @kill_withdraw_command = `ps -ef|grep -- -w|grep [n]srjb|awk '{print $2}'` ; 
+    if (@kill_withdraw_command) {
+        foreach (@kill_withdraw_command) {
+            print "I would kill:\n"; 
+            print "kill -9 $_\n" ; 
+        }
+    } 
+    `cp $export_tape_list /tmp/export_tape_list.$$` ; 
+    die"\n\n\t*** Exiting program ***\n\n" ; 
+###########################################
+} ## END subroutine "assign_to_location ###
+###########################################
+
+
+
+####################################
+### Withdrawing Tapes From Jukebox 
+####################################
+$counter = 0 ; 
+foreach (@volumes) {
+##while (<MMINFO>) {
+        chomp ; 
+        if ($total_exported < 9) {
+            print $total_exported+1,"  Processing tape..." ; 
+        }else{
+            print $total_exported+1," Processing tape..." ;
+        }
+
+	if ($counter==20) {		# The CAP is full... we must have the user empty it before continuing.
+		$capfull=1;
+		$tempsafe=$_;           # save our current MMINFO output volume name
+
+                #################################################
+                read_labels(); # See what tapes are in the CAP, 
+                               # then add to %tapes_list
+                #################################################
+
+		print "\n\nThe $host *$jukebox* CAP is full.\n";
+		while ($capfull==1) {
+                        print "\a" x 20 ;   
+			print "Please remove ALL tapes, then hit <ENTER> to continue...\n";
+			<STDIN>;
+                        print "###########\n" ; 
+                        print " Thank You" ; 
+                        print "\n###########\n\n" ; 
+
+			$sjirdtag_cmd="sjirdtag $scsidev";
+			unless (open(SJIRDTAG, "$sjirdtag_cmd|")) {
+				die "unable to open \'sjirdtag\' command pipe\n";
+			}
+			undef @barcode_list;
+			while (<SJIRDTAG>) {
+				if (/full=1/) {		# if this matches, we know the barcode is next...
+					$_ = <SJIRDTAG>;	# so read the barcode!
+					if (/VolumeTag\=\<(\w{6,6})/) {	# get the 6 alphanumeric character label
+						push(@barcode_list,$1); # and add it to our list of labels in CAP
+                                                ##chomp $1 ; 
+					}
+				}
+			}
+			if (@barcode_list) {
+				print "CAP still contains tape(s): @barcode_list\n";
+			}
+			else {$capfull=0; $counter=0;}
+		}
+	$_=$tempsafe;   # reload $_ with the MMINFO output we saved earlier before continuing...
+	}
+	chomp; ## I changed it from a chop !!!!!!!!!!!!!!!!!
+
+        #######################
+        ### If CAP not full ###
+        #######################
+
+	`nsrjb -j $jukebox -w $_ 2>> $export_script_errors`;
+        $inside_L700 = `mmlocate -n $_|grep -w $jukebox` ; 
+
+         unless ($inside_L700 =~ /$jukebox/ ) {
+             $counter++  ; 
+             $total_exported++ ; 
+             print "done with $_\n" ; 
+             $tapes_list{$_} = 'exported' ; 
+             push (@tapes_already_exported,$_) ; 
+             ###print "Found tape $_ in CAP with value \'$tapes_list{$_}\`\n" ;
+             ###print "\$rc = $rc / \$counter is now: $counter\n\n" ; 
+         }else{
+             #undef $location ; 
+             print "\a *** Not exported ***\n" ; 
+             print `mmlocate -n $_ ` ; 
+             next ; 
+         }
+
+}
+
+######################
+
+
+#
+# Now reset port polling period to NetWorke default of 15 seconds
+#
+`/bin/echo ". NSR jukebox" >/tmp/.commands`;
+`/bin/echo "update port polling period: 15" >>/tmp/.commands`;
+#print "\nResetting jukebox 'port polling interval' to default of 15 seconds\n";
+`nsradmin -i /tmp/.commands`;
+
+#
+# Forward email of contents of tapes ejected to appropriate parties (upon completion)
+#
+
+
+###############################################################
+### Separate those tapes successfully exported from those not
+###############################################################
+
+while ( ($tape,$status) = each %tapes_list) {
+    ###print "$tape => $status\n" ;
+    push(@tapes_attempted,"$tape => $status") ;
+}
+
+foreach (@tapes_attempted) {
+    if (/not/) {
+        push(@tapes_not_exported,$_) ; 
+        ###print "\n\nPushing $_ into array \@tapes_not_exported\n" ; 
+    }else{
+        push(@tapes_exported,$_) ; 
+        ###print "Pushing $_ into array \@tapes_exported\n" ; 
+    }
+}
+
+#print "\n\n##############################\n" ; 
+#print "List of Tapes Exported:\n" ;  
+#print "##############################\n" ; 
+#    map {print "$_ OK\n"} @tapes_exported ; 
+print "\n\n####################################\n" ; 
+print "List of Tapes NOT Exported(if any):\n" ; 
+print "####################################\n" ; 
+    map {print "$_\n"} @tapes_not_exported ; 
+    print "** All $total_exported tapes were Exported **\n" if scalar @tapes_not_exported == 0 ; 
+
+
+##################################################
+### Changing the location of each exported tape.
+##################################################
+
+print "\n\n################################################\n" ; 
+print "Assigning new location to tapes..." ;
+print "\n################################################\n" ; 
+$counter = 0 ; 
+##undef $1 ;
+
+foreach (@tapes_exported) {
+    /(\b\w{6,6}\b)/ ; 
+    $counter++ ; 
+    print "$counter   Changing location of tape $1 to Box_$box_number\n" if $counter < 10; 
+    print "$counter  Changing location of tape $1 to Box_$box_number\n" if $counter > 9 and $counter < 100; 
+    print "$counter Changing location of tape $1 to Box_$box_number\n" if $counter > 99; 
+    `mmlocate -u -n $1 "Box_$box_number" 2>> $export_script_errors` ; 
+}
+print "###############################################\n" ;
+print "\nPlease verify that total tapes exported = $counter\n\n" ; 
+print "###############################################\n\n" ;
+
+
+@export_script_errors = `cat $export_script_errors` ;
+
+
+
+#############################
+#############################
+### Send the email 
+#############################
+#############################
+
+foreach (@tapes_exported) {
+    push(@tapes_exported_mail,"$_\n")  ;  
+}
+
+foreach (@tapes_not_exported) {
+    push(@tapes_not_exported_mail,"$_\n") ; 
+}
+
+
+print "\a" x 30; 
+print "Preparing to send email to recipients...\n\n" ; 
+
+open(SENDMAIL, "| /usr/lib/sendmail -t -oi -odq") or die "Can't fork for sendmail: $!\n" ; 
+
+print SENDMAIL <<"EOF" ; 
+To: nynetops\@standardandpoors.com,william_murphy2\@sandp.com 
+From: NYSPBK05_daily_export_script
+Subject: Daily Tape Export [$jukebox]: Box_$box_number 
+
+
+B O X   N U M B E R  =  $box_number
+
+###################################
+List of Tapes exported:
+###################################
+@tapes_exported_mail
+
+###################################
+List of Tapes NOT exported:
+###################################
+@tapes_not_exported_mail
+
+
+###################################
+Export script errors and output:
+###################################
+@export_script_errors
+
+###################################
+Savesets
+###################################
+Not listed here
+
+
+EOF
+
+close (SENDMAIL) ; 
+
+print "#######################\n" ;
+print "#######################\n" ;
+print "## Processing Complete\n" ;
+print "#######################\n" ;
+print "#######################\n\n" ;
+
+####################
+## End of code    ##
+####################
